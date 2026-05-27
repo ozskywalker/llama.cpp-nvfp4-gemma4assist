@@ -61,8 +61,11 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         mtp_token_ordering = create_tensor(tn(LLM_TENSOR_MTP_TOKEN_ORDERING, "weight"), {n_vocab}, 0);
     }
 
-    // single, global rope_freqs used by the full-attention (proportional rope) layers
-    ggml_tensor * rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight"), {(int64_t) hparams.n_embd_head_k_full / 2}, TENSOR_NOT_REQUIRED);
+    // single, global rope_freqs used by the full-attention (proportional rope) layers.
+    // the "rope_freqs" name has no block placeholder, so it always resolves to the one
+    // global tensor; the bid only satisfies the repeating-tensor check, and TENSOR_DUPLICATED
+    // avoids reloading it for subsequent full layers.
+    int rope_freqs_flag = 0;
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -87,7 +90,8 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), {n_embd}, 0);
 
         if (!hparams.is_swa(i)) {
-            layer.rope_freqs = rope_freqs;
+            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head_i / 2}, rope_freqs_flag);
+            rope_freqs_flag = TENSOR_DUPLICATED;
         }
     }
 }

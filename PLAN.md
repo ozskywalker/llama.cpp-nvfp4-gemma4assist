@@ -130,18 +130,45 @@ Standard new-arch wiring (mirror Gemma 4), following the checklist below. The gr
 ### Phase C — Speculative integration (new draft type)
 Deliverable: the draft actually accelerates a Gemma 4 backbone end to end.
 
-1. `common/common.h`: add `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`.
-2. `common/speculative.cpp`: register the name; add an impl modeled on
-   `common_speculative_impl_draft_mtp` (`:409`). It must:
-   - Enable target pre-norm output (`llama_set_embeddings_pre_norm(ctx_tgt, true, …)`), read
-     `h_tgt` via `llama_get_embeddings_pre_norm`, assemble the `2·backbone_hidden_size` input
-     (see Risk 2), and run `ctx_dft`.
-   - **Supply the target's per-layer-type shared KV to the draft** (Risk 1) — the genuinely
-     new plumbing; likely a new `llama-ext.h` API to read target KV and inject it into the
-     draft graph's attention.
-   - Implement `process`/`draft`/`accept` and `need_embd_pre_norm()==true`.
-3. Wire CLI/server flags so `--spec`-style selection of `draft-gemma4-assistant` works with a
-   `--model` (Gemma 4 backbone) + `--model-draft` (this GGUF).
+Status: load path fixed (rope_freqs) and **runtime data flow fully reverse-engineered**
+(Risk 2 RESOLVED). Remaining: inference graph + cross-model plumbing + speculative impl.
+
+**Resolved runtime data flow** (transformers `SinglePositionMultiTokenCandidateGenerator`,
+`generation/candidate_generator.py:1357-1416`). The draft is an autoregressive multi-token
+predictor that reuses FIXED backbone KV across all its steps:
+- Seed: `last_hidden_state` = backbone final-layer hidden state of the last validated token;
+  `shared_kv_states` = backbone full+sliding KV (truncated to seq len); `last_token_id` = last
+  token; `position_ids = [len-1]`.
+- Each of K draft steps:
+  1. `last_token_embedding = TARGET_embed(last_token_id)`  (backbone embedding table, 5376-dim)
+  2. `inputs_embeds = concat(last_token_embedding, last_hidden_state)`  → 10752 = 2*backbone
+  3. assistant forward: `pre_projection` → 4 dense layers cross-attending over the fixed
+     `shared_kv_states` (bidirectional mask) → `post_projection` (→last_hidden_state) and
+     tied `lm_head` (→logits)
+  4. `last_token_id = argmax(logits)`; `last_hidden_state = post_projection out`; position++.
+
+**Three cross-model dependencies the driver must satisfy** (all from the TARGET):
+  (a) per-layer-type KV (last full-attn + last sliding-attn layer) — for the draft's attention;
+  (b) final hidden state of the last token — initial `last_hidden_state` (use the existing
+      `llama_get_embeddings_pre_norm` path if it matches `hidden_states[-1]`, else add an API);
+  (c) the target embedding table — to embed each drafted token in backbone (5376) space.
+
+**Implementation steps:**
+1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
+   `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /
+   default for swa) → cross-attention over provided K/V (GQA: 32 Q heads over 16 swa / 4 full
+   KV heads, head_dim 256/512) with a bidirectional mask → wo, layer_output_scale, post_attn
+   norm, residual → ffn (gelu, pre/post norm), residual} → output_norm → both `post_projection`
+   (as embeddings output) and `lm_head` logits. NOTE: backbone K/V must arrive as graph inputs.
+2. KV/hidden/embedding extraction API (new `llama-ext.h` surface): read the target's K/V for the
+   two layer types and its final hidden state; expose target `get_rows` on tok_embd (or run a
+   tiny target embed). This is the bulk of the novel infrastructure.
+3. `common/common.h`: add `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`.
+4. `common/speculative.cpp`: impl modeled on `common_speculative_impl_draft_mtp` (`:409`),
+   implementing the loop above (`process`/`draft`/`accept`, `need_embd_pre_norm()`), feeding the
+   draft `ctx_dft` via `batch.embd` of width 2*backbone and injecting the fixed backbone KV.
+5. Wire CLI/server flags so `draft-gemma4-assistant` is selectable with `--model` (Gemma 4
+   backbone) + `--model-draft` (this GGUF).
 
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
@@ -156,10 +183,9 @@ from quantization; spot-check `llama-quantize <f16> <nvfp4> NVFP4` output loads.
    states, not its own. MTP/EAGLE feed hidden states but compute their own KV. Faithful option:
    new plumbing to inject external K/V tensors into the draft's `build_attn`. Fallback: have the
    draft recompute KV from fed hidden states (diverges from reference; likely lowers acceptance).
-2. **Exact `inputs_embeds` composition.** The `2·backbone_hidden_size` input is assembled in
-   transformers' assisted-generation candidate generator (not in the modeling file). Must be
-   reverse-engineered to replicate the concatenation (which two vectors, what order) — wrong
-   assembly silently tanks acceptance rate.
+2. **Exact `inputs_embeds` composition. — RESOLVED.** It is
+   `concat(target_embed(last_token_id), last_hidden_state)` (both backbone-dim, in that order),
+   per `generation/candidate_generator.py:1379`. See the resolved data flow in Phase C.
 3. **Bidirectional + flipped-SWA masks.** llama.cpp masks are causal; the draft needs new mask
    construction (`create_bidirectional_*` + the SWA kv-axis flip in `create_attention_masks`).
 4. **Centroid head in ggml.** topk → gather → scatter-to-full-vocab with a per-position fill is
