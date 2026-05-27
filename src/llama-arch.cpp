@@ -57,6 +57,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA3,           "gemma3"           },
     { LLM_ARCH_GEMMA3N,          "gemma3n"          },
     { LLM_ARCH_GEMMA4,           "gemma4"           },
+    { LLM_ARCH_GEMMA4_ASSISTANT, "gemma4_assistant" },
     { LLM_ARCH_GEMMA_EMBEDDING,  "gemma-embedding"  },
     { LLM_ARCH_STARCODER2,       "starcoder2"       },
     { LLM_ARCH_MAMBA,            "mamba"            },
@@ -243,6 +244,13 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,             "%s.attention.shared_kv_layers"             },
+    { LLM_KV_ATTENTION_K_EQ_V,                       "%s.attention.k_eq_v"                       },
+
+    { LLM_KV_N_CENTROIDS,                            "%s.n_centroids"                            },
+    { LLM_KV_CENTROID_TOP_K,                         "%s.centroid_top_k"                         },
+    { LLM_KV_N_EMBD_BACKBONE,                        "%s.n_embd_backbone"                        },
+    { LLM_KV_USE_ORDERED_EMBEDDINGS,                 "%s.use_ordered_embeddings"                 },
+    { LLM_KV_REQUIRES_TARGET_ARCH,                   "%s.requires_target_arch"                   },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,       "%s.rope.dimension_count_swa"             },
@@ -383,6 +391,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_QKV,                               "blk.%d.attn_qkv" },
     { LLM_TENSOR_LAYER_OUT_NORM,                         "blk.%d.layer_output_norm" },
     { LLM_TENSOR_LAYER_OUT_SCALE,                        "blk.%d.layer_output_scale" },
+    { LLM_TENSOR_MTP_PRE_PROJ,                           "mtp.pre_projection" },
+    { LLM_TENSOR_MTP_POST_PROJ,                          "mtp.post_projection" },
+    { LLM_TENSOR_MTP_CENTROIDS,                          "mtp.centroids" },
+    { LLM_TENSOR_MTP_TOKEN_ORDERING,                     "mtp.token_ordering" },
     { LLM_TENSOR_ATTN_OUT_NORM,                          "blk.%d.attn_output_norm" },
     { LLM_TENSOR_POS_EMBD,                               "position_embd" },
     { LLM_TENSOR_FFN_ACT,                                "blk.%d.ffn.act" },
@@ -571,6 +583,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_CLS_NORM,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DENSE_2_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
     {LLM_TENSOR_DENSE_3_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
+    {LLM_TENSOR_MTP_PRE_PROJ,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // gemma4_assistant
+    {LLM_TENSOR_MTP_POST_PROJ,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // gemma4_assistant
+    {LLM_TENSOR_MTP_CENTROIDS,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // gemma4_assistant
+    {LLM_TENSOR_MTP_TOKEN_ORDERING,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_NONE}},    // gemma4_assistant (index buffer)
     {LLM_TENSOR_OUTPUT_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_OUTPUT_NORM_LFM2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DEC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},

@@ -765,6 +765,30 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4AssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    # Speculative-decoding draft head for a Gemma 4 backbone. It is a dense Gemma 4 text
+    # stack (no MoE, no per-layer embeddings, all KV layers shared) with no K/V projections:
+    # attention runs over the backbone's shared KV states. See requires_target_arch=gemma4.
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        # Gemma4Model only emits the global rope freq base; the draft also needs the SWA base.
+        swa_rope = self.rope_parameters.get("sliding_attention", {})
+        if (swa_theta := swa_rope.get("rope_theta")) is not None:
+            self.gguf_writer.add_rope_freq_base_swa(swa_theta)
+
+        # assistant-specific metadata
+        self.gguf_writer.add_n_embd_backbone(self.hparams["backbone_hidden_size"])
+        self.gguf_writer.add_n_centroids(self.hparams["num_centroids"])
+        self.gguf_writer.add_centroid_top_k(self.hparams["centroid_intermediate_top_k"])
+        self.gguf_writer.add_use_ordered_embeddings(bool(self.hparams.get("use_ordered_embeddings", False)))
+        self.gguf_writer.add_attn_k_eq_v(bool(self.hparams.get("attention_k_eq_v", False)))
+        self.gguf_writer.add_requires_target_arch("gemma4")
+
+
 @ModelBase.register("Gemma4ForConditionalGeneration")
 class Gemma4VisionAudioModel(MmprojModel):
     has_audio_encoder = True

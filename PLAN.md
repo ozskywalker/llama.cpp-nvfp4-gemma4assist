@@ -1,0 +1,196 @@
+# Add `Gemma4AssistantForCausalLM` support: convert, quantize (NVFP4), and run as a speculative draft
+
+## Context
+
+The goal is to take Google's "Gemma 4 ... it-assistant" model (HF arch
+`Gemma4AssistantForCausalLM`), convert HF → GGUF f16, quantize to NVFP4, and run it
+with llama.cpp on a Blackwell GPU.
+
+**Critical discovery that reshapes the request.** Inspecting the installed transformers
+source (`/home/luser/ai/venv/lib/python3.12/site-packages/transformers/models/gemma4_assistant/`)
+shows `Gemma4AssistantForCausalLM` is **not a standalone LLM** — it is a
+**speculative-decoding draft head** for a Gemma 4 backbone (HF "assistant model" =
+assisted/speculative generation). It cannot produce text on its own.
+
+From `modeling_gemma4_assistant.py` / `configuration_gemma4_assistant.py`:
+- `forward()` **ignores `input_ids`** and requires `inputs_embeds` (backbone hidden states)
+  + `shared_kv_states` (the backbone's KV from its last full-attention and sliding-attention
+  layers). Raises if either is missing.
+- Pipeline: `pre_projection` (`2·backbone_hidden_size → hidden_size`) → a **dense** Gemma 4
+  text stack (validated: **no MoE**, **no per-layer embeddings**, **all** KV layers shared)
+  run with **bidirectional + flipped-SWA masks** → `post_projection` (`hidden_size →
+  backbone_hidden_size`) → a logits head.
+- Logits head is either a plain tied `lm_head`, or (when `use_ordered_embeddings`) a
+  **centroid-clustered** head: `centroids` Linear (`hidden→num_centroids=2048`) → top-k=32
+  clusters → gather candidate rows via a `token_ordering` buffer → scatter logits back to the
+  full vocab (non-selected positions filled with `min-1`).
+- `backbone_hidden_size=1536`, `tie_word_embeddings=True`.
+
+The user confirmed: model is **downloaded locally**; **runtime is a Blackwell GPU**; and the
+chosen scope is **full speculative integration** (convert + quantize + actually accelerate a
+Gemma 4 backbone). Note the earlier "multimodal" answer does **not** apply — the assistant has
+only a `text_config`, no vision/audio towers.
+
+**Expectations.** This is a multi-week, research-grade integration, not a config tweak. The
+in-tree EAGLE3 draft (`common/speculative.cpp:377`) is still a stub; only MTP (`:409`) is a
+working hidden-state draft. The assistant needs everything MTP needs **plus** novel pieces
+(sharing the *target's* KV, bidirectional masks, centroid head). The plan is staged so each
+phase delivers a verifiable artifact.
+
+## What already exists (reuse, don't rebuild)
+
+- **Gemma 4 inference arch** `LLM_ARCH_GEMMA4` with full hparams/tensors/graph in
+  `src/models/gemma4.cpp`; handles SWA pattern, shared-KV layers (`n_layer_kv_from_start`,
+  reuse lambda at `src/llama-model.cpp:2047`), dual head dims, proportional RoPE. `n_layer==60
+  → LLM_TYPE_31B` already mapped.
+- **Gemma 4 converter** `Gemma4Model` (`conversion/gemma.py:617`) — vocab (`LlamaHfVocab`,
+  "gemma4" tokenizer model), SWA pattern, shared-KV / head-dim / RoPE metadata emission. The
+  dense assistant is a *simplification* of this (drop MoE / per-layer-embd code paths).
+- **Speculative framework** `common/speculative.cpp` with pluggable impls
+  (`COMMON_SPECULATIVE_TYPE_*` in `common/common.h:159`). The **MTP** impl (`:409`) is the
+  template: it feeds target pre-norm hidden states into the draft via `batch.embd` and a
+  separate `ctx_dft`.
+- **Pre-norm embedding staging API** (`src/llama-ext.h`): `llama_set_embeddings_pre_norm`,
+  `llama_get_embeddings_pre_norm[_ith]` — exactly the target-hidden-state extraction the draft
+  input needs.
+- **Embedding input in graphs**: `build_inp_embd` already supports raw-embedding input (the
+  gemma3 graph skips the `sqrt(n_embd)` scale when `ubatch.token` is null).
+- **ggml ops for the centroid head**: `ggml_top_k`/`ggml_argsort_top_k`, `ggml_get_rows`,
+  `ggml_set_rows` (`ggml/include/ggml.h`).
+- **NVFP4 quantization is architecture-agnostic** (`src/llama-quant.cpp`): once a valid GGUF
+  exists, `llama-quantize <in> <out> NVFP4` quantizes eligible 2D weights (row width multiple
+  of 64) and falls back to Q8_0 otherwise; token-embd/output stay higher precision.
+
+## Confirmed facts (from the local 31B checkpoint + reference GGUF)
+
+- Real checkpoint: `/models/huggingface/models--google--gemma-4-31B-it-assistant/...`.
+  A reference GGUF already exists (`models--AtomicChat--gemma-4-31B-it-assistant-GGUF`)
+  establishing the intended convention — arch string is **`gemma4_assistant`**,
+  `requires_target_arch = gemma4`, projections under the `mtp.` prefix.
+- Draft backbone is tiny & dense: **4 layers**, `hidden_size=1024`, `backbone_hidden_size=5376`,
+  `intermediate_size=8192`, head_count=32, layer_types `[swa,swa,swa,full]`, head_count_kv
+  `[16,16,16,4]`, key/value_length 512 (global) / 256 (swa), `num_kv_shared_layers=4` (all),
+  `use_ordered_embeddings=false`, `attention.k_eq_v=true`, tied embeddings.
+- **The draft has NO `k_proj`/`v_proj`/`k_norm` — only `attn_q` + `attn_q_norm`.** It cannot
+  compute its own KV; it MUST attend over the backbone's KV. Risk 1 is therefore *mandatory*,
+  not a faithful-vs-fallback choice (there is nothing to recompute from).
+- `use_ordered_embeddings=false` for the 31B ⇒ **no centroid head** for this model (plain tied
+  `lm_head`). The centroid path (Risk 4) only matters for variants that set it true.
+
+### Phase A — Conversion (HF → GGUF f16)  ✅ DONE & VERIFIED
+Output `/tmp/gemma4-asst-31b.f16.gguf` is **bit-for-bit identical** to the reference GGUF
+(49/49 tensors, all arch hparams match; only cosmetic `general.name` differs).
+Implemented: gguf-py constants/writer (arch, `mtp.*` tensors, KV keys), tensor mapping, and
+`Gemma4AssistantModel(Gemma4Model)` in `conversion/gemma.py` (+ registry). Original sub-steps:
+
+1. `conversion/__init__.py`: add `"Gemma4AssistantForCausalLM": "gemma"` to `TEXT_MODEL_MAP`.
+2. `conversion/gemma.py`: new `@ModelBase.register("Gemma4AssistantForCausalLM")
+   class Gemma4AssistantModel(Gemma3Model)` with `model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT`.
+   - Reuse the Gemma4 vocab approach (`set_vocab` via `LlamaHfVocab`, "gemma4" tokenizer).
+   - `set_gguf_parameters`: read from `text_config` (dense Gemma 4 backbone params: layers,
+     heads, head dims, SWA pattern, RMS eps, RoPE) **plus** assistant fields:
+     `backbone_hidden_size`, `num_centroids`, `centroid_intermediate_top_k`,
+     `use_ordered_embeddings`, `tie_word_embeddings`. Drop MoE / per-layer-embd emission.
+   - `modify_tensors`: map backbone `model.layers.*` exactly like the dense Gemma 4 path
+     (norm shift 0.0); map `pre_projection`, `post_projection`, `lm_head`,
+     `masked_embedding.centroids`, and the `masked_embedding.token_ordering` buffer
+     (integer index table — emit as I32, never quantized).
+3. `gguf-py/gguf/constants.py`: add `MODEL_ARCH.GEMMA4_ASSISTANT`, its `MODEL_TENSORS` list,
+   new tensor enums (`PRE_PROJ`, `POST_PROJ`, `CENTROIDS`, `TOKEN_ORDERING`), and new KV keys
+   (`backbone_hidden_size`, `num_centroids`, `centroid_top_k`, `use_ordered_embeddings`). Add
+   matching `gguf_writer` helpers (or use the generic `add_uint32`/`add_bool`).
+
+### Phase B — C++ inference arch `LLM_ARCH_GEMMA4_ASSISTANT`
+Status: **load path DONE & verified; inference graph deferred to Phase C** (it is inseparable
+from the cross-attention-over-backbone-KV plumbing). Implemented & verified:
+- arch enum/name, new `LLM_KV_*` + `LLM_TENSOR_*` (+ name strings + `LLM_TENSOR_INFOS`),
+  hparams fields, model struct, factory case, NEOX rope, and `src/models/gemma4-assistant.cpp`
+  (`load_arch_hparams` + `load_arch_tensors`: 49/49 tensors consumed, q-only attention, tied
+  head, single global `rope_freqs`, `mtp.*` projections).
+- `build_arch_graph` is a **throwing stub** with a clear message — decoding is unsupported
+  until the speculative cross-attention path exists. This is intentional: quantization and
+  model-load never build the graph.
+- Verified: `llama-quantize` loads the model (all metadata correct) and the f16→NVFP4 step
+  succeeds (895→380 MiB; `token_embd`→Q8_0; `mtp.*` + attn/ffn→NVFP4 with two-level `.scale`).
+
+Remaining (the hard part) — the deferred inference graph + everything below:
+
+Standard new-arch wiring (mirror Gemma 4), following the checklist below. The graph in a new
+`src/models/gemma4-assistant.cpp` is a **dense** Gemma-4 stack with three deltas:
+- **Input**: apply `pre_projection` to the incoming embedding (width `2·backbone_hidden_size`,
+  which differs from `n_embd` — input width must be handled explicitly) before layer 0.
+- **Output**: emit the `post_projection` hidden state (fed back into the speculative loop)
+  **and** logits. Logits via tied `lm_head`, or the centroid head when `use_ordered_embeddings`:
+  `centroids` matmul → `ggml_top_k`(32) → `get_rows` on the ordered candidate rows →
+  per-candidate dot products → scatter to a vocab-sized tensor pre-filled with a min value
+  (`ggml_set_rows`). Validate static-shape feasibility; this is the trickiest graph piece.
+- **Attention**: must attend over the **backbone's shared KV** with **bidirectional +
+  flipped-SWA** masks (see Risk 1 & 3). This is where the bulk of novel C++ work lives.
+
+### Phase C — Speculative integration (new draft type)
+Deliverable: the draft actually accelerates a Gemma 4 backbone end to end.
+
+1. `common/common.h`: add `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`.
+2. `common/speculative.cpp`: register the name; add an impl modeled on
+   `common_speculative_impl_draft_mtp` (`:409`). It must:
+   - Enable target pre-norm output (`llama_set_embeddings_pre_norm(ctx_tgt, true, …)`), read
+     `h_tgt` via `llama_get_embeddings_pre_norm`, assemble the `2·backbone_hidden_size` input
+     (see Risk 2), and run `ctx_dft`.
+   - **Supply the target's per-layer-type shared KV to the draft** (Risk 1) — the genuinely
+     new plumbing; likely a new `llama-ext.h` API to read target KV and inject it into the
+     draft graph's attention.
+   - Implement `process`/`draft`/`accept` and `need_embd_pre_norm()==true`.
+3. Wire CLI/server flags so `--spec`-style selection of `draft-gemma4-assistant` works with a
+   `--model` (Gemma 4 backbone) + `--model-draft` (this GGUF).
+
+### Phase D — Quantize to NVFP4
+Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
+
+Largely free once Phase A/B land (arch-agnostic path). Tasks: confirm `pre_projection`,
+`post_projection`, `centroids`, and backbone weights are NVFP4-eligible (row width % 64 == 0,
+else Q8_0 fallback); ensure `token_ordering` (index buffer) and tied embeddings are excluded
+from quantization; spot-check `llama-quantize <f16> <nvfp4> NVFP4` output loads.
+
+## Key risks / open questions
+1. **Shared target KV (highest risk).** The reference draft attends over the *backbone's* KV
+   states, not its own. MTP/EAGLE feed hidden states but compute their own KV. Faithful option:
+   new plumbing to inject external K/V tensors into the draft's `build_attn`. Fallback: have the
+   draft recompute KV from fed hidden states (diverges from reference; likely lowers acceptance).
+2. **Exact `inputs_embeds` composition.** The `2·backbone_hidden_size` input is assembled in
+   transformers' assisted-generation candidate generator (not in the modeling file). Must be
+   reverse-engineered to replicate the concatenation (which two vectors, what order) — wrong
+   assembly silently tanks acceptance rate.
+3. **Bidirectional + flipped-SWA masks.** llama.cpp masks are causal; the draft needs new mask
+   construction (`create_bidirectional_*` + the SWA kv-axis flip in `create_attention_masks`).
+4. **Centroid head in ggml.** topk → gather → scatter-to-full-vocab with a per-position fill is
+   expressible but must fit static-shape graph constraints; verify numerically vs reference.
+5. **Acceptance/sampling loop** integration (backend sampling, rollback on partial accept) per
+   the MTP impl's bookkeeping.
+
+## File checklist
+- `conversion/__init__.py` — register arch name → module.
+- `conversion/gemma.py` — `Gemma4AssistantModel` converter.
+- `gguf-py/gguf/constants.py` (+ writer helpers) — arch enum, tensors, KV keys.
+- `src/llama-arch.h` / `src/llama-arch.cpp` — `LLM_ARCH_GEMMA4_ASSISTANT`, name, new `LLM_KV_*`
+  and `LLM_TENSOR_*`, tensor-name map.
+- `src/llama-hparams.h` — `backbone n_embd`, `n_centroids`, `centroid_top_k`, ordered-embd flag.
+- `src/models/models.h` — `struct llama_model_gemma4_assistant`.
+- `src/models/gemma4-assistant.cpp` (new) — hparams/tensors/graph.
+- `src/llama-model.cpp` — factory case, `rope_type` (NEOX), all-shared-KV handling.
+- `src/llama-graph.cpp` (+ `src/llama-ext.h`) — external-KV attention + bidirectional masks.
+- `common/common.h`, `common/speculative.cpp` — new draft type + impl.
+- CLI/server flag wiring for selecting the draft type.
+
+## Verification
+1. **Convert**: `python convert_hf_to_gguf.py <model_dir> --outtype f16`; inspect with
+   `llama-gguf` / `gguf_dump.py` — confirm `general.architecture == gemma4-assistant`, all
+   tensors (pre/post proj, centroids, token_ordering) and new KV keys present.
+2. **Quantize**: `llama-quantize <f16>.gguf <nvfp4>.gguf NVFP4`; confirm it loads via
+   `llama-cli`/loader without missing-tensor errors.
+3. **Numerical parity**: for a fixed `(inputs_embeds, shared_kv_states)`, dump draft logits and
+   compare against the HF `Gemma4AssistantForCausalLM` reference within tolerance.
+4. **End-to-end speculative**: run a Gemma 4 backbone with the draft type selected; verify
+   generated text matches the backbone-alone output (lossless speculative decoding) and report
+   acceptance rate + tokens/s speedup on the Blackwell GPU.
+5. Build with CUDA Blackwell enabled; confirm native FP4 kernels are used (no CPU dequant
+   fallback) for the NVFP4 weights.

@@ -217,6 +217,13 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // gemma4_assistant (speculative draft head; cross-attends over the backbone's KV)
+    uint32_t n_embd_backbone        = 0;     // hidden size of the target/backbone model
+    uint32_t n_centroids            = 0;     // ordered-embeddings centroid count
+    uint32_t centroid_top_k         = 0;     // active centroids per token
+    bool     use_ordered_embeddings = false; // centroid-clustered lm head vs plain tied head
+    bool     attn_k_eq_v            = false; // backbone K and V projections are shared
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
