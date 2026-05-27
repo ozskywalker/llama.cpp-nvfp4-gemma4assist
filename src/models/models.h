@@ -822,6 +822,30 @@ struct llama_model_gemma4 : public llama_model_base {
 };
 
 
+// Speculative-decoding draft head for a Gemma 4 backbone. Dense Gemma-4 text stack with no
+// K/V projections: every layer cross-attends over the backbone's shared KV states. The model
+// reads projected backbone hidden states as input embeddings and emits both a projected hidden
+// state (post_projection) and next-token logits (tied lm_head). See requires_target_arch=gemma4.
+struct llama_model_gemma4_assistant : public llama_model_base {
+    llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // backbone<->draft projections (model level, no block id)
+    ggml_tensor * mtp_pre_proj  = nullptr; // [2*n_embd_backbone, n_embd]
+    ggml_tensor * mtp_post_proj = nullptr; // [n_embd, n_embd_backbone]
+    ggml_tensor * mtp_centroids       = nullptr; // [n_embd, n_centroids] (ordered embeddings only)
+    ggml_tensor * mtp_token_ordering  = nullptr; // [vocab_size] index buffer (ordered embeddings only)
+
+    struct graph : public llm_graph_context {
+        const llama_model & model;
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_gemma_embedding : public llama_model_base {
     llama_model_gemma_embedding(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

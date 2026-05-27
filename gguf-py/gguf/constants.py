@@ -153,6 +153,11 @@ class Keys:
         HIDDEN_ACT                        = "{arch}.hidden_activation"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
+        N_CENTROIDS                       = "{arch}.n_centroids"
+        CENTROID_TOP_K                    = "{arch}.centroid_top_k"
+        N_EMBD_BACKBONE                   = "{arch}.n_embd_backbone"
+        USE_ORDERED_EMBEDDINGS            = "{arch}.use_ordered_embeddings"
+        REQUIRES_TARGET_ARCH              = "{arch}.requires_target_arch"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -185,6 +190,7 @@ class Keys:
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+        K_EQ_V                       = "{arch}.attention.k_eq_v"
 
         class Indexer:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
@@ -433,6 +439,7 @@ class MODEL_ARCH(IntEnum):
     GEMMA3           = auto()
     GEMMA3N          = auto()
     GEMMA4           = auto()
+    GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
@@ -581,6 +588,10 @@ class MODEL_TENSOR(IntEnum):
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
+    MTP_PRE_PROJ         = auto() # gemma4_assistant
+    MTP_POST_PROJ        = auto() # gemma4_assistant
+    MTP_CENTROIDS        = auto() # gemma4_assistant (ordered embeddings)
+    MTP_TOKEN_ORDERING   = auto() # gemma4_assistant (ordered embeddings)
     PER_LAYER_TOKEN_EMBD = auto() # gemma3n
     PER_LAYER_MODEL_PROJ = auto() # gemma3n
     PER_LAYER_INP_GATE   = auto() # gemma3n
@@ -953,6 +964,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA3:           "gemma3",
     MODEL_ARCH.GEMMA3N:          "gemma3n",
     MODEL_ARCH.GEMMA4:           "gemma4",
+    MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4_assistant",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
     MODEL_ARCH.STARCODER2:       "starcoder2",
     MODEL_ARCH.RWKV6:            "rwkv6",
@@ -1100,6 +1112,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
     MODEL_TENSOR.LAYER_OUT_SCALE:           "blk.{bid}.layer_output_scale",
+    MODEL_TENSOR.MTP_PRE_PROJ:              "mtp.pre_projection",             # gemma4_assistant
+    MODEL_TENSOR.MTP_POST_PROJ:             "mtp.post_projection",            # gemma4_assistant
+    MODEL_TENSOR.MTP_CENTROIDS:             "mtp.centroids",                  # gemma4_assistant
+    MODEL_TENSOR.MTP_TOKEN_ORDERING:        "mtp.token_ordering",             # gemma4_assistant
     MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:      "per_layer_token_embd",           # gemma3n
     MODEL_TENSOR.PER_LAYER_MODEL_PROJ:      "per_layer_model_proj",           # gemma3n
     MODEL_TENSOR.PER_LAYER_PROJ_NORM:       "per_layer_proj_norm",            # gemma3n
@@ -2495,6 +2511,26 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PER_LAYER_PROJ,
         MODEL_TENSOR.PER_LAYER_PROJ_NORM,
         MODEL_TENSOR.PER_LAYER_POST_NORM,
+    ],
+    MODEL_ARCH.GEMMA4_ASSISTANT: [
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
+        MODEL_TENSOR.MTP_PRE_PROJ,
+        MODEL_TENSOR.MTP_POST_PROJ,
+        MODEL_TENSOR.MTP_CENTROIDS,
+        MODEL_TENSOR.MTP_TOKEN_ORDERING,
     ],
     MODEL_ARCH.GEMMA_EMBEDDING: [
         MODEL_TENSOR.TOKEN_EMBD,

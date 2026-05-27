@@ -116,6 +116,23 @@ class TensorNameMap:
             "rotary_pos_emb.inv_freq",  # chatglm
         ),
 
+        # gemma4_assistant: speculative draft projections between backbone and draft hidden sizes
+        MODEL_TENSOR.MTP_PRE_PROJ: (
+            "pre_projection",  # gemma4_assistant
+        ),
+
+        MODEL_TENSOR.MTP_POST_PROJ: (
+            "post_projection",  # gemma4_assistant
+        ),
+
+        MODEL_TENSOR.MTP_CENTROIDS: (
+            "masked_embedding.centroids",  # gemma4_assistant (ordered embeddings)
+        ),
+
+        MODEL_TENSOR.MTP_TOKEN_ORDERING: (
+            "masked_embedding.token_ordering",  # gemma4_assistant (ordered embeddings)
+        ),
+
         MODEL_TENSOR.ROPE_FACTORS_LONG: (),
         MODEL_TENSOR.ROPE_FACTORS_SHORT: (),
 
