@@ -212,12 +212,19 @@ logic ~`:1330`, and the dispatch switch ~`:1386`). The AR loop (per the resolved
   the last validated token via `llama_get_embeddings_pre_norm_ith` (reuse the MTP path; set
   `need_embd_pre_norm()`=true). VALIDATE on GPU that this equals HF `hidden_states[-1]` (pre- vs
   post-final-norm); if it's the post-norm one, use `llama_get_embeddings_ith`.
-- **Target shared KV** (the only genuinely new infra): register a `cb_eval` callback
-  (llama_context_params.cb_eval) on the *target* context that captures the backbone's
-  `Kcur_pos` (post-RoPE K) and `Vcur_normed` (V) at the **last full-attention** and **last
-  sliding-attention** layers (the layers feeding `n_layer_kv_from_start`), copied GPU→host.
-  These become io.k_full/v_full and io.k_swa/v_swa. NOTE: cb_eval is set at target-context
-  creation, so the server must create ctx_tgt with this callback (a setup wrinkle to handle).
+- **Target shared KV** — CONFIRMED against the live 31B via `devtools/gemma4_assistant/probe_kv.cpp`.
+  A `cb_eval` callback (llama_context_params.cb_eval) on the target captures the backbone's
+  `Kcur_pos` (post-RoPE K) and `Vcur_normed` (normed V). For google-gemma-4-31B (60 layers,
+  shared_kv_layers=0, full-attn every 6th): the shared KV = the **last full layer (59)** →
+  `Kcur_pos-59`/`Vcur_normed-59` `[512,4,seq]` (io.k_full/v_full) and the **last sliding layer
+  (58)** → `Kcur_pos-58`/`Vcur_normed-58` `[256,16,seq]` (io.k_swa/v_swa). Shapes match the
+  draft's external KV exactly; used as-is (no extra rope/norm). Generalize the layer indices
+  from `sliding_window_pattern` (last False = full, last True = sliding). cb_eval is set at
+  target-context creation, so the server must create ctx_tgt with this callback (setup wrinkle).
+  **IMPORTANT nuance the probe revealed**: `Kcur_pos` holds only the *current batch's* tokens;
+  the draft needs the *full-sequence* KV (in the target's KV cache). So either (a) read the KV
+  cache for layers 58/59, or (b) do a full-sequence target forward to capture them (matches how
+  HF assembles shared_kv_states; simpler but re-prefills each cycle).
 - **Target embed**: each draft step needs `target_embed(last_token)` (backbone 5376-dim). Add a
   small API to read backbone `token_embd` rows (get_rows) into host, or fold via a tiny target
   graph. Concat with `last_hidden` → io.embd (width 2*backbone).
