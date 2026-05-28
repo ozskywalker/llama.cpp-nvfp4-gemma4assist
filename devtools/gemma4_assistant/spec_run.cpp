@@ -235,6 +235,8 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> spec_out;
     int n_acc_tot = 0, n_draft_tot = 0, cycles = 0;
+    std::vector<int> raw_match(K, 0),  raw_total(K, 0);   // drafts[k] == target argmax[k] (ignores chain)
+    std::vector<int> cond_match(K, 0), cond_total(K, 0);  // in-chain acceptance (all prior matched)
     while ((int) spec_out.size() < n_predict) {
         const int L = (int) seq.size();
         // draft K tokens from fixed position L-1
@@ -251,14 +253,23 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> cand = seq;
         cand.insert(cand.end(), drafts.begin(), drafts.end());
         target_forward(cand, hidden_last, logits_tail, K + 1); // logits at last K+1 positions
-        // accept: target argmax at pos (L-1+j) is the token at position L+j
+        // target argmax at pos (L-1+j) is the token at position L+j
+        std::vector<llama_token> targ(K + 1);
+        for (int j = 0; j <= K; ++j) targ[j] = argmax(logits_tail.data() + (size_t) j * n_vocab, n_vocab);
+        // per-k raw quality (independent of the chain)
+        for (int j = 0; j < K; ++j) { raw_total[j]++; if (targ[j] == drafts[j]) raw_match[j]++; }
+        // accept the matched prefix + 1 bonus (all emitted tokens are target argmax => lossless)
         int m = 0;
+        bool chain = true;
         for (int j = 0; j <= K; ++j) {
-            llama_token tt = argmax(logits_tail.data() + (size_t) j * n_vocab, n_vocab);
-            spec_out.push_back(tt);
-            seq.push_back(tt);
+            spec_out.push_back(targ[j]);
+            seq.push_back(targ[j]);
             m++;
-            if (j == K || tt != drafts[j]) break; // mismatch (or consumed all drafts): tt is the bonus, stop
+            if (j < K && chain) {
+                cond_total[j]++;
+                if (targ[j] == drafts[j]) cond_match[j]++; else chain = false;
+            }
+            if (j == K || targ[j] != drafts[j]) break;
         }
         n_acc_tot += (m - 1); // accepted draft tokens (excluding the bonus)
         cycles++;
@@ -294,6 +305,12 @@ int main(int argc, char ** argv) {
     printf("acceptance: %d/%d drafted tokens accepted over %d cycles (%.1f%%); ~%.2f tokens/cycle\n",
            n_acc_tot, n_draft_tot, cycles, 100.0 * n_acc_tot / (n_draft_tot ? n_draft_tot : 1),
            (double) spec_out.size() / (cycles ? cycles : 1));
+    printf("per-k draft quality:\n");
+    for (int k = 0; k < K; ++k) {
+        printf("  k=%d  raw %2d/%-2d (%5.1f%%)   in-chain %2d/%-2d (%5.1f%%)\n", k,
+               raw_match[k], raw_total[k], 100.0 * raw_match[k] / (raw_total[k] ? raw_total[k] : 1),
+               cond_match[k], cond_total[k], 100.0 * cond_match[k] / (cond_total[k] ? cond_total[k] : 1));
+    }
 
     llama_free(ctx_dft); llama_model_free(dft);
     llama_free(ctx_tgt); llama_model_free(tgt);
