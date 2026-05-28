@@ -932,8 +932,10 @@ private:
             if (spec_g4a) {
                 // the gemma4_assistant draft decodes one token per step and cross-attends over the
                 // backbone KV; a large ubatch would size the attention-scores buffer as
-                // kv_len(=ctx) * n_ubatch * n_head -> many GiB at long context. Keep it tiny.
-                cparams.n_batch  = 1;
+                // kv_len(=ctx) * n_ubatch * n_head -> many GiB at long context. Keep n_ubatch=1.
+                // n_batch must stay >=2 (common_context_can_seq_rm probes with a 2-token decode);
+                // it only bounds the logical batch + the small logits buffer, not the compute buffer.
+                cparams.n_batch  = 8;
                 cparams.n_ubatch = 1;
             }
 
