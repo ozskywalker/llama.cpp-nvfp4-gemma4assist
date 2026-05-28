@@ -926,6 +926,17 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
 
+            const bool spec_g4a = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT) != params_base.speculative.types.end();
+            if (spec_g4a) {
+                // the gemma4_assistant draft decodes one token per step and cross-attends over the
+                // backbone KV; a large ubatch would size the attention-scores buffer as
+                // kv_len(=ctx) * n_ubatch * n_head -> many GiB at long context. Keep it tiny.
+                cparams.n_batch  = 1;
+                cparams.n_ubatch = 1;
+            }
+
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
             //       the extra memory for small models is likely negligible?
             cparams.n_rs_seq = 0;
