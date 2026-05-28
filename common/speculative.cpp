@@ -847,6 +847,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
     std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
+    int fpp_full = 0, fpp_swa = 0;    // floats per KV position (full / swa); set on first capture
 
     llama_gemma4_assistant_io io{};
 
@@ -879,7 +880,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.end());
         acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.end());
         acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.end());
-        acc_len += verify_n;
+        acc_len = fpp_full > 0 ? (int) (acc_kf.size() / fpp_full) : 0; // derive: stays consistent with the data
     }
 
     common_speculative_impl_draft_gemma4_assistant(const common_params_speculative & p, uint32_t n_seq)
@@ -914,7 +915,11 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     }
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // new generation: reset accumulated KV (single-seq)
+        // NOTE: begin() is called AFTER the prompt is processed, so resetting here would wipe the
+        // prompt KV. A new sequence is instead detected in process() via pos[0]==0.
+    }
+
+    void reset_state() {
         acc_kf.clear(); acc_vf.clear(); acc_ks.clear(); acc_vs.clear(); acc_len = 0;
         last_hidden.clear(); cap_clear();
     }
@@ -922,6 +927,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) { cap_clear(); return true; }
         const int n = batch_in.n_tokens;
+        if (batch_in.pos[0] == 0) { reset_state(); } // new sequence (fresh prompt)
         verify_n = n;
         // store per-position post-norm hidden (HF hidden_states[-1]) for accept()
         verify_h.resize((size_t) n * n_embd_bb);
@@ -929,18 +935,21 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             const float * h = llama_get_embeddings_ith(params.ctx_tgt, i);
             if (h) memcpy(verify_h.data() + (size_t) i * n_embd_bb, h, (size_t) n_embd_bb * sizeof(float));
         }
-        // seed on the first batch (prompt): treat it as fully validated
-        // TODO: confirm the framework's process/accept ordering under the server; subsequent
-        // verify batches are committed in accept().
+        if (fpp_full == 0 && !cap_kf.empty()) { fpp_full = (int)(cap_kf.size() / n); fpp_swa = (int)(cap_ks.size() / n); }
+        // commit prompt/prefill decodes directly (no accept() follows them); only seed when KV was
+        // actually captured this decode (a capture-empty decode would otherwise desync acc_len).
+        // TODO: capture can still be empty on reused-graph decodes; subsequent verify batches are
+        // committed via accept(). The off-by-one between id_last and last_hidden is the remaining
+        // acceptance lever.
         bool seeded = false;
-        if (acc_len == 0) {
+        if (acc_len == 0 && !cap_kf.empty()) {
             acc_append();
             if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
-            cap_clear(); // committed; next decode's capture starts fresh (accept() handles verify batches)
+            cap_clear();
             seeded = true;
         }
-        LOG_INF("g4a process: n_tokens=%d tok[0]=%d tok[last]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
-                n, batch_in.token[0], batch_in.token[n-1], (int)(cap_kf.empty()?0:1), (int) seeded, acc_len);
+        LOG_INF("g4a process: n_tokens=%d pos0=%d tok[0]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
+                n, batch_in.pos[0], batch_in.token[0], (int)(cap_kf.empty()?0:1), (int) seeded, acc_len);
         return true;
     }
 
@@ -983,20 +992,19 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         LOG_INF("g4a accept: seq=%d n_accepted=%d verify_n=%d acc_len(before)=%d\n",
                 (int) seq_id, (int) n_accepted, verify_n, acc_len);
-        if (seq_id != 0 || verify_n <= 0) return;
-        // commit the first n_accepted positions of the last verify batch to the accumulated KV.
-        // TODO: confirm against the server whether the verify batch == drafts and how the bonus
-        // token's KV is represented (see MTP pending_h/rollback). First cut commits a prefix.
-        const int n = std::min<int>(n_accepted, verify_n);
-        if (n <= 0) return;
-        const size_t bf = (size_t) cap_kf.size() / std::max(1, verify_n); // floats per position (full)
-        const size_t bs = (size_t) cap_ks.size() / std::max(1, verify_n); // floats per position (swa)
-        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.begin() + bf * n);
-        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.begin() + bf * n);
-        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.begin() + bs * n);
-        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.begin() + bs * n);
-        acc_len += n;
-        last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
+        if (seq_id != 0 || verify_n <= 0 || cap_kf.empty()) { cap_clear(); return; }
+        // verify batch = [id_last, draft_0, ..., draft_{K-1}]; n_accepted = accepted draft count.
+        // validated this cycle = id_last + n_accepted drafts => commit (n_accepted + 1) positions.
+        const int cap_pos = fpp_full > 0 ? (int)(cap_kf.size() / fpp_full) : verify_n;
+        const int commit  = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
+        if (commit <= 0) { cap_clear(); return; }
+        const size_t bf = (size_t) fpp_full, bs = (size_t) fpp_swa;
+        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.begin() + bf * commit);
+        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.begin() + bf * commit);
+        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.begin() + bs * commit);
+        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.begin() + bs * commit);
+        acc_len = fpp_full > 0 ? (int)(acc_kf.size() / fpp_full) : acc_len;
+        last_hidden.assign(verify_h.begin() + (size_t)(commit - 1) * n_embd_bb, verify_h.begin() + (size_t) commit * n_embd_bb);
         cap_clear();
     }
 
