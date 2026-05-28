@@ -907,6 +907,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         { std::vector<float> rb; for (int64_t o = 0; o < post.ne[1]; ++o) { g4a_row_f32(post, o, rb); memcpy(post_f32.data() + (size_t) o * n_embd_dft, rb.data(), (size_t) n_embd_dft * sizeof(float)); } }
 
         llama_set_eval_callback(params.ctx_tgt, cb_eval, this); // install backbone KV capture
+        llama_set_embeddings(params.ctx_dft, true); // draft outputs the post-norm hidden (for host post_projection)
 
         LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d\n",
                 __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa);
