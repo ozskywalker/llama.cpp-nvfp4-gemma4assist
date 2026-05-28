@@ -188,6 +188,16 @@ for build_arch_graph. NOTE: build_arch_graph must obtain the external KV length 
 2*backbone embd from the speculative driver (a shared side-channel), so the graph and the driver
 are co-designed; the standalone harness gates the math without that plumbing.
 
+**build_arch_graph + input plumbing DONE & VERIFIED through the real llama API.**
+`src/models/gemma4-assistant.cpp` now implements the forward (transcribed from replay.cpp);
+`llama_gemma4_assistant_set_io()` (src/llama-ext.h) attaches the driver's host buffers (wide
+embd + external full/swa KV + kv_len) to the model, and `llm_graph_input_gemma4_assistant`
+copies them into the graph. `res->t_embd` is the post-norm hidden (n_embd); the driver applies
+mtp.post_projection on the host. Gate `devtools/gemma4_assistant/test_decode.cpp` loads the
+draft, attaches the oracle inputs, runs `llama_decode`, and matches HF to rel ~9e-4 on logits +
+hidden (argmax 17887 == HF). Reserve-time (io==null) falls back to kv_len=n_ctx for sizing.
+REMAINING: the speculative driver + target-KV extraction.
+
 **Implementation steps:**
 1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
    `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /

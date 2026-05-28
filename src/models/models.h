@@ -797,6 +797,24 @@ struct llama_model_gemma4 : public llama_model_base {
 };
 
 
+struct llama_gemma4_assistant_io; // defined in llama-ext.h; filled by the speculative driver
+
+// Carries the backbone's external KV + the projected-input embeddings into the draft graph.
+// set_input copies from the model-attached llama_gemma4_assistant_io into the graph tensors.
+class llm_graph_input_gemma4_assistant : public llm_graph_input_i {
+public:
+    llm_graph_input_gemma4_assistant(const llama_gemma4_assistant_io * io) : io(io) {}
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * embd   = nullptr; // [2*n_embd_backbone, n_tokens]
+    ggml_tensor * k_full = nullptr;
+    ggml_tensor * v_full = nullptr;
+    ggml_tensor * k_swa  = nullptr;
+    ggml_tensor * v_swa  = nullptr;
+
+    const llama_gemma4_assistant_io * io = nullptr;
+};
+
 // Speculative-decoding draft head for a Gemma 4 backbone. Dense Gemma-4 text stack with no
 // K/V projections: every layer cross-attends over the backbone's shared KV states. The model
 // reads projected backbone hidden states as input embeddings and emits both a projected hidden
@@ -811,6 +829,9 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     ggml_tensor * mtp_post_proj = nullptr; // [n_embd, n_embd_backbone]
     ggml_tensor * mtp_centroids       = nullptr; // [n_embd, n_centroids] (ordered embeddings only)
     ggml_tensor * mtp_token_ordering  = nullptr; // [vocab_size] index buffer (ordered embeddings only)
+
+    // draft I/O attached by the speculative driver before each decode (see llama-ext.h)
+    mutable const llama_gemma4_assistant_io * io = nullptr;
 
     struct graph : public llm_graph_context {
         const llama_model & model;
