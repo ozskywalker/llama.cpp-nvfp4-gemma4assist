@@ -163,6 +163,21 @@ KV) — and the draft loop always runs q_len=1, so the bidirectional/flipped-SWA
 NOT needed for normal operation until context exceeds the 1024 window. First gate uses q_len=1,
 small kv_len → pure cross-attention, no mask.
 
+**VERIFIED computation spec** (numpy reimpl `devtools/gemma4_assistant/numpy_reference.py`
+matches the HF oracle to rel ~1e-6 at every layer + final logits; argmax matches). Transcribe
+this into `build_arch_graph`:
+- `x = inputs_embeds @ pre_projection.weight.T`  (input width 2*backbone -> n_embd)
+- per layer: RMSNorm is **w-only (NOT 1+w)**; attention `scaling = 1.0`;
+  `q = q_norm(q_proj(x)); q = rope(q)`; **K,V = shared_kv[layer_type] used as-is**
+  (no k_norm, no rope on K); GQA repeat; `o = o_proj(attn)`;
+  `sa = x + post_attention_norm(o)`;
+  `x = sa + post_feedforward_norm(mlp(pre_feedforward_norm(sa)))` (gated gelu_tanh);
+  **`x *= layer_scalar` at the END of the layer** (scales the residual stream — was the key bug).
+- rope: swa layers theta=1e4 rotate full head_dim; full layer "proportional" theta=1e6 with
+  freq_factors = [1]*nrot + [1e30]*(hd/2-nrot), nrot = hd*0.25/2 (== gemma4's rope_freqs tensor).
+- final: `nrm = model.norm(x)` (w-only); `logits = nrm @ embed.T` (tied);
+  `returned_hidden = nrm @ post_projection.T`.
+
 **Implementation steps:**
 1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
    `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /
