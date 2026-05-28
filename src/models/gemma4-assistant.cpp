@@ -109,7 +109,8 @@ void llm_graph_input_gemma4_assistant::set_input(const llama_ubatch * ubatch) {
         return;
     }
     // input graph tensors live in a host-mapped buffer; copy the driver's host data into them
-    auto cp = [](ggml_tensor * t, const float * src) {
+    // (embd is F32, the K/V inputs are F16; memcpy uses the tensor's byte size either way)
+    auto cp = [](ggml_tensor * t, const void * src) {
         if (t && src) {
             GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
             memcpy(t->data, src, ggml_nbytes(t));
@@ -133,8 +134,12 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
     const int64_t n_embd_bb = hparams.n_embd_backbone;
     // io is null during the context's graph_reserve (buffer sizing); fall back to n_ctx so the
     // reserved graph covers the worst case. set_input no-ops when io is null. Real decodes attach
-    // io (via llama_gemma4_assistant_set_io) and the graph is rebuilt with the actual kv_len.
-    const int64_t kv_len = (io && io->kv_len > 0) ? io->kv_len : std::max<int64_t>(cparams.n_ctx, 1);
+    // io (via llama_gemma4_assistant_set_io) and the graph is rebuilt with the actual lengths.
+    // Sliding-attention layers only see the last `sliding_window` positions, so kv_len_swa is
+    // bounded -- this is what keeps long-context memory in check.
+    const int64_t kv_len_full = (io && io->kv_len_full > 0) ? io->kv_len_full : std::max<int64_t>(cparams.n_ctx, 1);
+    const int64_t kv_len_swa  = (io && io->kv_len_swa  > 0) ? io->kv_len_swa
+                                                            : std::min<int64_t>(std::max<int64_t>(cparams.n_ctx, 1), std::max<uint32_t>(hparams.n_swa, 1));
 
     // representative swa / full layers (for the external KV head dims)
     int idx_swa = -1, idx_full = -1;
@@ -143,19 +148,19 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
         else                    { if (idx_full < 0) idx_full = il; }
     }
 
-    // inputs provided by the speculative driver (see llama_gemma4_assistant_set_io)
+    // inputs provided by the speculative driver (see llama_gemma4_assistant_set_io); KV is F16
     auto inp = std::make_unique<llm_graph_input_gemma4_assistant>(io);
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*n_embd_bb, n_tokens);
     ggml_set_input(inp->embd);
     if (idx_full >= 0) {
-        inp->k_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len);
-        inp->v_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len);
+        inp->k_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full);
+        inp->v_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full);
         ggml_set_input(inp->k_full);
         ggml_set_input(inp->v_full);
     }
     if (idx_swa >= 0) {
-        inp->k_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len);
-        inp->v_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len);
+        inp->k_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len_swa);
+        inp->v_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len_swa);
         ggml_set_input(inp->k_swa);
         ggml_set_input(inp->v_swa);
     }

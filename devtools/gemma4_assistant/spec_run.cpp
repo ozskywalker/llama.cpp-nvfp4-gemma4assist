@@ -37,6 +37,7 @@ static const int N_EMBD_BB = 5376; // backbone hidden
 static const int HD_FULL = 512, NKV_FULL = 4;
 static const int HD_SWA  = 256, NKV_SWA  = 16;
 static const int N_EMBD_DRAFT = 1024;
+static const int SLIDING_WINDOW = 1024; // sliding-attention layers see only the last this-many KV positions
 
 // ---------- captured backbone KV (host) ----------
 struct KVCap {
@@ -215,10 +216,19 @@ int main(int argc, char ** argv) {
         std::vector<float> wide(2 * n_embd_bb);
         memcpy(wide.data(),               emb.data(),    (size_t) n_embd_bb * sizeof(float));
         memcpy(wide.data() + n_embd_bb,   cur_h.data(),  (size_t) n_embd_bb * sizeof(float));
-        io.kv_len = kv_len; io.n_tokens = 1;
+        // build F16 feed buffers: full layers see all kv_len positions, sliding layers the last window
+        const int kv_swa = std::min(kv_len, SLIDING_WINDOW);
+        const int fpp_f = HD_FULL * NKV_FULL, fpp_s = HD_SWA * NKV_SWA;
+        static std::vector<ggml_fp16_t> kf16, vf16, ks16, vs16;
+        kf16.resize((size_t) kv_len * fpp_f); vf16.resize((size_t) kv_len * fpp_f);
+        for (size_t i = 0; i < kf16.size(); ++i) { kf16[i] = ggml_fp32_to_fp16(acc_kf[i]); vf16[i] = ggml_fp32_to_fp16(acc_vf[i]); }
+        ks16.resize((size_t) kv_swa * fpp_s); vs16.resize((size_t) kv_swa * fpp_s);
+        const size_t off_s = (size_t)(kv_len - kv_swa) * fpp_s;
+        for (size_t i = 0; i < ks16.size(); ++i) { ks16[i] = ggml_fp32_to_fp16(acc_ks[off_s + i]); vs16[i] = ggml_fp32_to_fp16(acc_vs[off_s + i]); }
+        io.kv_len_full = kv_len; io.kv_len_swa = kv_swa; io.n_tokens = 1;
         io.embd = wide.data();
-        io.k_full = acc_kf.data(); io.v_full = acc_vf.data();
-        io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
+        io.k_full = kf16.data(); io.v_full = vf16.data();
+        io.k_swa  = ks16.data(); io.v_swa  = vs16.data();
         llama_gemma4_assistant_set_io(dft, &io);
 
         llama_memory_clear(llama_get_memory(ctx_dft), true);
