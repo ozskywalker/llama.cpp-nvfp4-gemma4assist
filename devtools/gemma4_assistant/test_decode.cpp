@@ -38,15 +38,16 @@ static void write_bin(const std::string & p, const void * d, size_t n) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 6) { fprintf(stderr, "usage: %s <draft.gguf> <in_dir> <out_dir> <kv_len> <q_len>\n", argv[0]); return 1; }
+    if (argc < 6) { fprintf(stderr, "usage: %s <draft.gguf> <in_dir> <out_dir> <kv_len> <q_len> [n_gpu_layers]\n", argv[0]); return 1; }
     const std::string mpath = argv[1], indir = argv[2], outdir = argv[3];
     const int kv_len = atoi(argv[4]);
     const int q      = atoi(argv[5]);
+    const int ngl    = argc > 6 ? atoi(argv[6]) : 0; // 0 = CPU; 99 = offload all to GPU
 
     llama_backend_init();
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0; // CPU gate
+    mp.n_gpu_layers = ngl;
     llama_model * model = llama_model_load_from_file(mpath.c_str(), mp);
     if (!model) { fprintf(stderr, "load failed\n"); return 1; }
 
