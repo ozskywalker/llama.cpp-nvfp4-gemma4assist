@@ -129,3 +129,8 @@ struct llama_gemma4_assistant_io {
 // attach (or clear, with io == nullptr) draft I/O to a gemma4_assistant model.
 // no-op for models of any other architecture.
 LLAMA_API void llama_gemma4_assistant_set_io(struct llama_model * model, const struct llama_gemma4_assistant_io * io);
+
+// install a graph eval callback on an already-created context (cb_eval is otherwise only
+// settable at context creation). used by the gemma4_assistant speculative driver to capture the
+// target backbone's shared KV (Kcur_pos / Vcur_normed) during decode.
+LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data);
