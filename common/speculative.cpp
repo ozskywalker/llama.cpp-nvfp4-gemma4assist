@@ -2,6 +2,8 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
 #include "llama.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_pre_norm / llama_get_embeddings_pre_norm_ith (used by MTP)
 #include "log.h"
@@ -25,6 +27,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-gemma4-assistant", COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -777,6 +780,220 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// ---- gemma4_assistant draft (cross-attention over the backbone's shared KV) ----
+// FIRST CUT, single-sequence. Ports devtools/gemma4_assistant/spec_run.cpp onto the framework.
+// Lifecycle details (process/accept semantics under continuous batching) are to be tuned against
+// a running llama-server. Known first-cut assumptions are flagged with TODO.
+namespace {
+struct g4a_raw { std::vector<uint8_t> bytes; enum ggml_type type = GGML_TYPE_F32; int64_t ne[4] = {1,1,1,1}; };
+
+static g4a_raw g4a_load_raw(const std::string & path, const std::string & name) {
+    struct ggml_context * ctx = nullptr;
+    struct gguf_init_params p = { /*no_alloc=*/ true, /*ctx=*/ &ctx };
+    struct gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    g4a_raw r;
+    if (!g) { LOG_ERR("g4a: cannot open %s\n", path.c_str()); return r; }
+    int64_t idx = gguf_find_tensor(g, name.c_str());
+    if (idx < 0) { LOG_ERR("g4a: tensor %s not in %s\n", name.c_str(), path.c_str()); gguf_free(g); ggml_free(ctx); return r; }
+    ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
+    r.type = t->type;
+    for (int i = 0; i < 4; ++i) r.ne[i] = t->ne[i];
+    const size_t nb  = ggml_nbytes(t);
+    const size_t off = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, idx);
+    r.bytes.resize(nb);
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f) { fseek(f, (long) off, SEEK_SET); if (fread(r.bytes.data(), 1, nb, f) != nb) LOG_ERR("g4a: short read %s\n", name.c_str()); fclose(f); }
+    gguf_free(g); ggml_free(ctx);
+    return r;
+}
+
+static void g4a_row_f32(const g4a_raw & r, int64_t row, std::vector<float> & out) {
+    const int64_t ne0 = r.ne[0];
+    out.resize(ne0);
+    if (r.type == GGML_TYPE_F32) {
+        memcpy(out.data(), r.bytes.data() + (size_t) row * ne0 * 4, ne0 * 4);
+    } else if (r.type == GGML_TYPE_F16) {
+        const ggml_fp16_t * s = (const ggml_fp16_t *) (r.bytes.data() + (size_t) row * ne0 * 2);
+        for (int64_t i = 0; i < ne0; ++i) out[i] = ggml_fp16_to_fp32(s[i]);
+    } else if (r.type == GGML_TYPE_Q8_0) {
+        const int QK = 32, BS = 34; const int64_t nblk = ne0 / QK;
+        const uint8_t * base = r.bytes.data() + (size_t) row * nblk * BS;
+        for (int64_t b = 0; b < nblk; ++b) {
+            const uint8_t * blk = base + b * BS; ggml_fp16_t d16; memcpy(&d16, blk, 2);
+            const float d = ggml_fp16_to_fp32(d16); const int8_t * qs = (const int8_t *) (blk + 2);
+            for (int i = 0; i < QK; ++i) out[b * QK + i] = d * qs[i];
+        }
+    } else {
+        LOG_ERR("g4a: unsupported token_embd type %s\n", ggml_type_name(r.type));
+    }
+}
+} // namespace
+
+struct common_speculative_impl_draft_gemma4_assistant : public common_speculative_impl {
+    common_params_speculative_draft params;
+
+    int n_embd_bb = 0;     // backbone (target) hidden size
+    int n_embd_dft = 0;    // draft hidden size
+    int n_vocab = 0;
+    int layer_full = -1, layer_swa = -1; // backbone shared-KV layers
+
+    g4a_raw tok_embd;                 // backbone token_embd (raw, for embedding draft tokens)
+    std::vector<float> post_f32;      // draft mtp.post_projection [n_embd_bb * n_embd_dft]
+
+    // shared KV captured from the target via cb_eval (accumulated within a decode, cleared per process)
+    std::vector<float> cap_kf, cap_vf, cap_ks, cap_vs; int cap_seq = 0;
+    // accumulated full-sequence backbone shared KV
+    std::vector<float> acc_kf, acc_vf, acc_ks, acc_vs; int acc_len = 0;
+    // per-position post-norm hidden from the last process() (for accept())
+    std::vector<float> verify_h; int verify_n = 0;
+    std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
+
+    llama_gemma4_assistant_io io{};
+
+    // cb_eval trampoline: capture Kcur_pos / Vcur_normed at the backbone shared-KV layers
+    static bool cb_eval(struct ggml_tensor * t, bool ask, void * ud) {
+        auto * self = (common_speculative_impl_draft_gemma4_assistant *) ud;
+        const char * n = t->name;
+        const bool want = strncmp(n, "Kcur_pos-", 9) == 0 || strncmp(n, "Vcur_normed-", 12) == 0;
+        if (ask) return want;
+        if (want) self->on_eval(t);
+        return true;
+    }
+    void on_eval(struct ggml_tensor * t) {
+        auto grab = [&](const std::string & name, std::vector<float> & dst) {
+            if (name == t->name) {
+                const size_t off = dst.size();
+                dst.resize(off + ggml_nelements(t));
+                ggml_backend_tensor_get(t, dst.data() + off, 0, ggml_nbytes(t));
+                cap_seq = (int) t->ne[2]; // per-ubatch; total tracked via acc on append
+            }
+        };
+        grab("Kcur_pos-"    + std::to_string(layer_full), cap_kf);
+        grab("Vcur_normed-" + std::to_string(layer_full), cap_vf);
+        grab("Kcur_pos-"    + std::to_string(layer_swa),  cap_ks);
+        grab("Vcur_normed-" + std::to_string(layer_swa),  cap_vs);
+    }
+    void cap_clear() { cap_kf.clear(); cap_vf.clear(); cap_ks.clear(); cap_vs.clear(); cap_seq = 0; }
+    void acc_append() {
+        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.end());
+        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.end());
+        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.end());
+        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.end());
+        acc_len += verify_n;
+    }
+
+    common_speculative_impl_draft_gemma4_assistant(const common_params_speculative & p, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT, n_seq)
+        , params(p.draft)
+    {
+        GGML_ASSERT(params.ctx_tgt && params.ctx_dft && "gemma4_assistant requires ctx_tgt and ctx_dft");
+        if (n_seq != 1) {
+            LOG_WRN("%s: FIRST CUT supports single-sequence only (n_seq=%u); multi-seq is TODO\n", __func__, n_seq);
+        }
+        const llama_model * mt = llama_get_model(params.ctx_tgt);
+        const llama_model * md = llama_get_model(params.ctx_dft);
+        n_embd_bb  = llama_model_n_embd(mt);
+        n_embd_dft = llama_model_n_embd(md);
+        n_vocab    = llama_vocab_n_tokens(llama_model_get_vocab(md));
+        const int n_layer = llama_model_n_layer(mt);
+        // TODO: derive from the target's sliding_window_pattern metadata; first cut assumes the
+        // gemma4 pattern (full attention every 6th layer).
+        for (int i = 0; i < n_layer; ++i) if ((i + 1) % 6 == 0) layer_full = i;
+        layer_swa = (layer_full == n_layer - 1) ? n_layer - 2 : n_layer - 1;
+
+        tok_embd = g4a_load_raw(params.model_path_tgt, "token_embd.weight");
+        g4a_raw post = g4a_load_raw(params.mparams.path, "mtp.post_projection.weight"); // ne=[n_embd_dft, n_embd_bb]
+        post_f32.resize((size_t) post.ne[1] * post.ne[0]);
+        { std::vector<float> rb; for (int64_t o = 0; o < post.ne[1]; ++o) { g4a_row_f32(post, o, rb); memcpy(post_f32.data() + (size_t) o * n_embd_dft, rb.data(), (size_t) n_embd_dft * sizeof(float)); } }
+
+        llama_set_eval_callback(params.ctx_tgt, cb_eval, this); // install backbone KV capture
+
+        LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d\n",
+                __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        // new generation: reset accumulated KV (single-seq)
+        acc_kf.clear(); acc_vf.clear(); acc_ks.clear(); acc_vs.clear(); acc_len = 0;
+        last_hidden.clear(); cap_clear();
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) { cap_clear(); return true; }
+        const int n = batch_in.n_tokens;
+        verify_n = n;
+        // store per-position post-norm hidden (HF hidden_states[-1]) for accept()
+        verify_h.resize((size_t) n * n_embd_bb);
+        for (int i = 0; i < n; ++i) {
+            const float * h = llama_get_embeddings_ith(params.ctx_tgt, i);
+            if (h) memcpy(verify_h.data() + (size_t) i * n_embd_bb, h, (size_t) n_embd_bb * sizeof(float));
+        }
+        // seed on the first batch (prompt): treat it as fully validated
+        // TODO: confirm the framework's process/accept ordering under the server; subsequent
+        // verify batches are committed in accept().
+        if (acc_len == 0) {
+            acc_append();
+            if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
+            cap_clear(); // committed; next decode's capture starts fresh (accept() handles verify batches)
+        }
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        if (n_seq == 0) return;
+        auto & dp = dparams[0];
+        if (!dp.drafting || acc_len == 0 || last_hidden.empty()) return;
+
+        const llama_model * md = llama_get_model(params.ctx_dft);
+        llama_token cur_tok = dp.id_last;
+        std::vector<float> cur_h = last_hidden;
+        std::vector<float> emb, wide(2 * n_embd_bb), nrm;
+        for (int k = 0; k < params.n_max; ++k) {
+            g4a_row_f32(tok_embd, cur_tok, emb);
+            memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
+            memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
+            io.kv_len = acc_len; io.n_tokens = 1; io.embd = wide.data();
+            io.k_full = acc_kf.data(); io.v_full = acc_vf.data();
+            io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
+            llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
+
+            llama_memory_clear(llama_get_memory(params.ctx_dft), true);
+            llama_batch b = llama_batch_init(1, 0, 1);
+            b.n_tokens = 1; b.token[0] = 0; b.pos[0] = acc_len - 1; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
+            if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); break; }
+            const float * dl = llama_get_logits_ith(params.ctx_dft, 0);
+            llama_token dtok = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dtok]) dtok = v;
+            const float * dn = llama_get_embeddings_ith(params.ctx_dft, 0); // post-norm hidden [n_embd_dft]
+            // host post_projection: out[o] = sum_i dn[i] * post_f32[o*n_embd_dft + i]
+            nrm.assign(n_embd_bb, 0.0f);
+            for (int o = 0; o < n_embd_bb; ++o) { const float * w = post_f32.data() + (size_t) o * n_embd_dft; float s = 0; for (int i = 0; i < n_embd_dft; ++i) s += dn[i] * w[i]; nrm[o] = s; }
+            cur_h = nrm; cur_tok = dtok;
+            dp.result->push_back(dtok);
+            llama_batch_free(b);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id != 0 || verify_n <= 0) return;
+        // commit the first n_accepted positions of the last verify batch to the accumulated KV.
+        // TODO: confirm against the server whether the verify batch == drafts and how the bonus
+        // token's KV is represented (see MTP pending_h/rollback). First cut commits a prefix.
+        const int n = std::min<int>(n_accepted, verify_n);
+        if (n <= 0) return;
+        const size_t bf = (size_t) cap_kf.size() / std::max(1, verify_n); // floats per position (full)
+        const size_t bs = (size_t) cap_ks.size() / std::max(1, verify_n); // floats per position (swa)
+        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.begin() + bf * n);
+        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.begin() + bf * n);
+        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.begin() + bs * n);
+        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.begin() + bs * n);
+        acc_len += n;
+        last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
+        cap_clear();
+    }
+
+    bool need_embd() const override { return true; } // post-norm backbone hidden
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1273,6 +1490,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT: return "draft-gemma4-assistant";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -1330,6 +1548,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        bool has_gemma4_assistant = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT)) && params.draft.ctx_dft != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1338,7 +1557,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1378,6 +1597,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
+        if (has_gemma4_assistant) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -1396,6 +1618,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_gemma4_assistant>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

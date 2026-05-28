@@ -935,6 +935,7 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            params_base.speculative.draft.model_path_tgt = params_base.model.path;
         } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                              COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",
@@ -956,6 +957,7 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            params_base.speculative.draft.model_path_tgt = params_base.model.path;
         }
 
         if (has_mmproj) {
