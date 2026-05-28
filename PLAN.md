@@ -240,6 +240,22 @@ Verified driver building blocks: draft decode (GPU, rel ~1.7e-3), host post_proj
 (rel 4e-7). Remaining is the framework integration + target KV/embed extraction, validated
 end-to-end by acceptance rate / lossless output against the live 31B target.
 
+### Phase C driver — END-TO-END LOSSLESS RUN ACHIEVED (option-b)
+`devtools/gemma4_assistant/spec_run.cpp` runs greedy speculative decoding (target 31B + draft)
+and is verified **lossless** (output == target-only greedy) on the Blackwell GPU. Confirmed the
+full pipeline: cb_eval KV capture (layers 59/58) + fixed-position AR draft loop + host
+post_projection feedback + target verify/accept. Key finding: the seed/feedback hidden must be
+**POST-norm** (HF hidden_states[-1]); fixing this raised acceptance 5%→12.5%.
+Remaining:
+- **Acceptance is modest (~1.5 tok/cycle)** — investigate: per-k breakdown, and whether the
+  **NVFP4 target** (draft was trained on the full-precision backbone) degrades the hidden/KV the
+  draft consumes. (Acceptance is the same for option-a/b; it's a quality issue, not perf.)
+- **Option-a perf swap**: replace the per-cycle full-sequence re-prefill with a KV-cache read of
+  layers 58/59 (no recompute) — required for real speedup at large ctx.
+- **Framework/server integration**: spec_run.cpp is standalone; fold into
+  `common/speculative.cpp` as `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` for llama-server
+  (incl. creating ctx_tgt with the KV-capture cb_eval).
+
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
 
