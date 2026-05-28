@@ -178,6 +178,16 @@ this into `build_arch_graph`:
 - final: `nrm = model.norm(x)` (w-only); `logits = nrm @ embed.T` (tied);
   `returned_hidden = nrm @ post_projection.T`.
 
+**ggml forward VERIFIED** (`devtools/gemma4_assistant/replay.cpp`): a standalone ggml harness
+loads the draft GGUF, replays the oracle inputs, and reproduces every layer + logits to rel
+~1e-4..1e-3 (f16-vs-f32 noise; argmax matches HF). This proves the *actual ggml ops* — NEOX
+`ggml_rope_ext` with proportional `freq_factors`, cross-attention via the build_attn_mha permute
+layout (q [hd,n_head,q]; external K/V [hd,nkv,kvlen]; GQA broadcast; scale 1.0; no mask), gemma
+sandwich norms, gelu, end-of-layer layer_scalar. replay.cpp is the exact op-sequence reference
+for build_arch_graph. NOTE: build_arch_graph must obtain the external KV length + values + the
+2*backbone embd from the speculative driver (a shared side-channel), so the graph and the driver
+are co-designed; the standalone harness gates the math without that plumbing.
+
 **Implementation steps:**
 1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
    `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /
