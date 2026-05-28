@@ -1,0 +1,5 @@
+# generated verification artifacts (regenerate with dump_hf_reference.py / the replay harness)
+*.npz
+*.json
+*.gguf
+*.bin
