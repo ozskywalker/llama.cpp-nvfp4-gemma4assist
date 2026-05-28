@@ -129,7 +129,7 @@ int main(int argc, char ** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <target.gguf> <draft_f16.gguf> [n_predict] [k_draft]\n", argv[0]); return 1; }
     const std::string tpath = argv[1], dpath = argv[2];
     const int n_predict = argc > 3 ? atoi(argv[3]) : 24;
-    const int K = argc > 4 ? atoi(argv[4]) : 4;
+    const int K = argc > 4 ? atoi(argv[4]) : 2;
 
     llama_backend_init();
 
@@ -165,27 +165,32 @@ int main(int argc, char ** argv) {
     int np = llama_tokenize(vocab, prompt, (int) strlen(prompt), toks.data(), 64, true, false);
     toks.resize(np);
 
-    // run the target over a full sequence, capture KV + per-pos pre-norm hidden + logits
+    // option-a: incremental target decode + host-side accumulation of the shared KV.
+    // KV accumulators hold ggml layout [hd, nkv, pos] with pos slowest, so appending a decode's
+    // captured Kcur_pos/Vcur_normed appends new positions to the full-sequence shared KV.
     KVCap cap;
-    auto target_forward = [&](const std::vector<llama_token> & seq, std::vector<float> & hidden_last, std::vector<float> & logits_tail, int n_tail) {
-        g_cap = &cap;
-        llama_memory_clear(llama_get_memory(ctx_tgt), true);
-        llama_batch b = llama_batch_init((int) seq.size(), 0, 1);
-        b.n_tokens = (int) seq.size();
-        for (int i = 0; i < (int) seq.size(); ++i) {
-            b.token[i] = seq[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0;
-            b.logits[i] = (i >= (int) seq.size() - n_tail);
-        }
+    std::vector<float> acc_kf, acc_vf, acc_ks, acc_vs; int acc_len = 0;
+    auto append_cap = [&]() {
+        acc_kf.insert(acc_kf.end(), cap.k_full.begin(), cap.k_full.end());
+        acc_vf.insert(acc_vf.end(), cap.v_full.begin(), cap.v_full.end());
+        acc_ks.insert(acc_ks.end(), cap.k_swa.begin(),  cap.k_swa.end());
+        acc_vs.insert(acc_vs.end(), cap.v_swa.begin(),  cap.v_swa.end());
+        acc_len += cap.seq;
+    };
+    // decode `tk` at positions [base, base+n); the target cache must already hold [0, base).
+    // captures the new positions' shared KV into `cap`; returns per-position logits + last hidden.
+    auto decode_incr = [&](const std::vector<llama_token> & tk, int base,
+                           std::vector<float> & out_logits, std::vector<float> & out_hidden) {
+        g_cap = &cap; cap = KVCap{};
+        const int n = (int) tk.size();
+        llama_batch b = llama_batch_init(n, 0, 1);
+        b.n_tokens = n;
+        for (int i = 0; i < n; ++i) { b.token[i] = tk[i]; b.pos[i] = base + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1; }
         if (llama_decode(ctx_tgt, b) != 0) { fprintf(stderr, "target decode failed\n"); exit(1); }
-        // post-norm hidden of the last token (HF hidden_states[-1])
-        const float * h = llama_get_embeddings_ith(ctx_tgt, (int) seq.size() - 1);
-        hidden_last.assign(h, h + n_embd_bb);
-        // logits for the last n_tail positions
-        logits_tail.resize((size_t) n_tail * n_vocab);
-        for (int j = 0; j < n_tail; ++j) {
-            const float * lg = llama_get_logits_ith(ctx_tgt, (int) seq.size() - n_tail + j);
-            memcpy(logits_tail.data() + (size_t) j * n_vocab, lg, (size_t) n_vocab * sizeof(float));
-        }
+        out_logits.resize((size_t) n * n_vocab);
+        for (int i = 0; i < n; ++i) { const float * lg = llama_get_logits_ith(ctx_tgt, i); memcpy(out_logits.data() + (size_t) i * n_vocab, lg, (size_t) n_vocab * sizeof(float)); }
+        const float * h = llama_get_embeddings_ith(ctx_tgt, n - 1);
+        out_hidden.assign(h, h + n_embd_bb);
         llama_batch_free(b);
     };
 
@@ -212,8 +217,8 @@ int main(int argc, char ** argv) {
         memcpy(wide.data() + n_embd_bb,   cur_h.data(),  (size_t) n_embd_bb * sizeof(float));
         io.kv_len = kv_len; io.n_tokens = 1;
         io.embd = wide.data();
-        io.k_full = cap.k_full.data(); io.v_full = cap.v_full.data();
-        io.k_swa  = cap.k_swa.data();  io.v_swa  = cap.v_swa.data();
+        io.k_full = acc_kf.data(); io.v_full = acc_vf.data();
+        io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
         llama_gemma4_assistant_set_io(dft, &io);
 
         llama_memory_clear(llama_get_memory(ctx_dft), true);
@@ -228,66 +233,92 @@ int main(int argc, char ** argv) {
         return dtok;
     };
 
-    // ---- speculative loop (greedy, single sequence) ----
+    // ---- speculative loop (greedy, single sequence; option-a incremental KV) ----
+    llama_memory_clear(llama_get_memory(ctx_tgt), true);
     std::vector<llama_token> seq = toks;
-    std::vector<float> hidden_last, logits_tail;
-    target_forward(seq, hidden_last, logits_tail, 1); // seed: KV over prompt + hidden + logits[L-1]
+    std::vector<float> logits_last(n_vocab), hidden_last, plog, phid;
+    decode_incr(seq, 0, plog, phid);                              // prompt: cache 0..P-1, capture full KV
+    append_cap();                                                 // acc = prompt shared KV
+    memcpy(logits_last.data(), plog.data() + (size_t)(seq.size() - 1) * n_vocab, n_vocab * sizeof(float));
+    hidden_last = phid;
+
+    if (getenv("G4A_DEBUG_KV")) {
+        // extend 4 tokens incrementally (greedy), accumulating KV
+        for (int i = 0; i < 4; ++i) {
+            llama_token tt = argmax(logits_last.data(), n_vocab);
+            std::vector<float> l2, h2;
+            decode_incr(std::vector<llama_token>{tt}, (int) seq.size(), l2, h2);
+            append_cap();
+            memcpy(logits_last.data(), l2.data(), n_vocab * sizeof(float));
+            hidden_last = h2; seq.push_back(tt);
+        }
+        std::vector<float> inc_kf = acc_kf, inc_ks = acc_ks; // incremental accumulation
+        // full forward of the same sequence (cache empty)
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        std::vector<float> lg, hd;
+        decode_incr(seq, 0, lg, hd);
+        double mxf = 0, mxs = 0;
+        for (size_t i = 0; i < cap.k_full.size(); ++i) mxf = std::max(mxf, (double) fabs(cap.k_full[i] - inc_kf[i]));
+        for (size_t i = 0; i < cap.k_swa.size();  ++i) mxs = std::max(mxs, (double) fabs(cap.k_swa[i]  - inc_ks[i]));
+        printf("KV diff incremental-vs-full: k_full max=%g (n=%zu/%zu)  k_swa max=%g (n=%zu/%zu)\n",
+               mxf, cap.k_full.size(), inc_kf.size(), mxs, cap.k_swa.size(), inc_ks.size());
+        return 0;
+    }
 
     std::vector<llama_token> spec_out;
     int n_acc_tot = 0, n_draft_tot = 0, cycles = 0;
     std::vector<int> raw_match(K, 0),  raw_total(K, 0);   // drafts[k] == target argmax[k] (ignores chain)
     std::vector<int> cond_match(K, 0), cond_total(K, 0);  // in-chain acceptance (all prior matched)
     while ((int) spec_out.size() < n_predict) {
-        const int L = (int) seq.size();
-        // draft K tokens from fixed position L-1
+        const int L = (int) seq.size();                          // == acc_len; cache holds 0..L-1
+        // draft K tokens from fixed position L-1 over the accumulated backbone KV
         std::vector<llama_token> drafts;
         llama_token cur_tok = seq[L - 1];
         std::vector<float> cur_h = hidden_last;
-        for (int k = 0; k < K; ++k) {
-            llama_token dt = draft_step(cur_tok, cur_h, /*kv_len=*/ L, /*pos=*/ L - 1);
-            drafts.push_back(dt);
-            cur_tok = dt;
-        }
+        for (int k = 0; k < K; ++k) { llama_token dt = draft_step(cur_tok, cur_h, /*kv_len=*/ L, /*pos=*/ L - 1); drafts.push_back(dt); cur_tok = dt; }
         n_draft_tot += K;
-        // verify: target over seq + drafts, logits at positions L-1 .. L-1+K
-        std::vector<llama_token> cand = seq;
-        cand.insert(cand.end(), drafts.begin(), drafts.end());
-        target_forward(cand, hidden_last, logits_tail, K + 1); // logits at last K+1 positions
-        // target argmax at pos (L-1+j) is the token at position L+j
+        // verify: incremental decode of drafts at L..L+K-1 (cap discarded)
+        std::vector<float> vlog, vhid;
+        decode_incr(drafts, L, vlog, vhid);
+        // targ[j] predicts position L+j: j==0 from logits_last (pos L-1), else from verify logits
         std::vector<llama_token> targ(K + 1);
-        for (int j = 0; j <= K; ++j) targ[j] = argmax(logits_tail.data() + (size_t) j * n_vocab, n_vocab);
-        // per-k raw quality (independent of the chain)
+        targ[0] = argmax(logits_last.data(), n_vocab);
+        for (int j = 1; j <= K; ++j) targ[j] = argmax(vlog.data() + (size_t)(j - 1) * n_vocab, n_vocab);
         for (int j = 0; j < K; ++j) { raw_total[j]++; if (targ[j] == drafts[j]) raw_match[j]++; }
-        // accept the matched prefix + 1 bonus (all emitted tokens are target argmax => lossless)
-        int m = 0;
+        // accept matched prefix + 1 bonus (all emitted are target argmax => lossless)
+        std::vector<llama_token> accepted;
         bool chain = true;
         for (int j = 0; j <= K; ++j) {
-            spec_out.push_back(targ[j]);
-            seq.push_back(targ[j]);
-            m++;
-            if (j < K && chain) {
-                cond_total[j]++;
-                if (targ[j] == drafts[j]) cond_match[j]++; else chain = false;
-            }
+            accepted.push_back(targ[j]);
+            if (j < K && chain) { cond_total[j]++; if (targ[j] == drafts[j]) cond_match[j]++; else chain = false; }
             if (j == K || targ[j] != drafts[j]) break;
         }
-        n_acc_tot += (m - 1); // accepted draft tokens (excluding the bonus)
+        const int m = (int) accepted.size();
+        n_acc_tot += (m - 1);
+        // roll back the K verify positions, then commit the m accepted tokens (correct cache + KV)
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, L, -1);
+        std::vector<float> clog, chid;
+        decode_incr(accepted, L, clog, chid);                    // cache -> 0..L+m-1; cap = m new positions
+        append_cap();                                            // acc grows by m
+        memcpy(logits_last.data(), clog.data() + (size_t)(m - 1) * n_vocab, n_vocab * sizeof(float));
+        hidden_last = chid;
+        for (auto t : accepted) { seq.push_back(t); spec_out.push_back(t); }
         cycles++;
-        // refresh hidden_last for the NEW last token: re-forward the accepted sequence
-        // (the verification forward covered cand; if we accepted a prefix, recompute for exactness)
-        target_forward(seq, hidden_last, logits_tail, 1);
-        if ((int) spec_out.size() >= n_predict) break;
     }
 
-    // ---- baseline: target-only greedy ----
-    std::vector<llama_token> base = toks;
+    // ---- baseline: target-only greedy (incremental) ----
     std::vector<llama_token> base_out;
     {
-        std::vector<float> hl, lt;
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        std::vector<float> lg, hd;
+        decode_incr(toks, 0, lg, hd);
+        std::vector<float> last(lg.end() - n_vocab, lg.end());
         for (int i = 0; i < (int) spec_out.size(); ++i) {
-            target_forward(base, hl, lt, 1);
-            llama_token tt = argmax(lt.data(), n_vocab);
-            base_out.push_back(tt); base.push_back(tt);
+            llama_token tt = argmax(last.data(), n_vocab);
+            base_out.push_back(tt);
+            std::vector<float> l2, h2;
+            decode_incr(std::vector<llama_token>{tt}, (int) toks.size() + i, l2, h2);
+            last.assign(l2.end() - n_vocab, l2.end());
         }
     }
 

@@ -246,15 +246,29 @@ and is verified **lossless** (output == target-only greedy) on the Blackwell GPU
 full pipeline: cb_eval KV capture (layers 59/58) + fixed-position AR draft loop + host
 post_projection feedback + target verify/accept. Key finding: the seed/feedback hidden must be
 **POST-norm** (HF hidden_states[-1]); fixing this raised acceptance 5%→12.5%.
-Remaining:
-- **Acceptance is modest (~1.5 tok/cycle)** — investigate: per-k breakdown, and whether the
-  **NVFP4 target** (draft was trained on the full-precision backbone) degrades the hidden/KV the
-  draft consumes. (Acceptance is the same for option-a/b; it's a quality issue, not perf.)
-- **Option-a perf swap**: replace the per-cycle full-sequence re-prefill with a KV-cache read of
-  layers 58/59 (no recompute) — required for real speedup at large ctx.
-- **Framework/server integration**: spec_run.cpp is standalone; fold into
-  `common/speculative.cpp` as `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` for llama-server
-  (incl. creating ctx_tgt with the KV-capture cb_eval).
+### Phase C driver — OPTION (a) DONE (incremental, lossless) + acceptance findings
+spec_run.cpp now uses the efficient path: incremental target decode + host-side accumulation of
+the shared KV (append each cycle's captured Kcur_pos/Vcur_normed; roll back rejected drafts via
+llama_memory_seq_rm). Still **lossless**. Default K=2 (k>=2 almost never accepts; K=2 drafts 38
+vs 76 at K=4 for the same output).
+
+Per-k breakdown (NVFP4 target + f16 draft): k=0 ~32%, k>=1 ~5%; ~1.3 tok/cycle.
+Key findings:
+- Acceptance is **fundamentally limited by the NVFP4 target**: the draft was trained on the
+  full-precision backbone and is sensitive to small perturbations in the hidden/KV it consumes.
+- Incremental KV != full-forward KV (max ~0.08 on K), independent of KV-cache dtype — it's the
+  NVFP4 matmul/attention using different kernels for single-token vs batched decode. So option-b's
+  earlier 53% k=0 was a **full-forward artifact**; option-a's ~32% is the realistic deployment
+  number (the target always decodes incrementally in production).
+- A higher-precision target would lift acceptance but Q8_0/f16 31B doesn't fit in 32GB.
+
+KNOWN LIMITATION: the SWA layer's accumulated KV isn't windowed; correct only while
+seq_len <= sliding_window (1024). For longer contexts, feed only the last 1024 SWA positions
+(needs separate kv_len for full vs swa in the io/graph).
+
+Remaining: **framework/server integration** — fold spec_run.cpp into `common/speculative.cpp` as
+`COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` for llama-server (creating ctx_tgt with the
+KV-capture cb_eval), and SWA windowing for long context.
 
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
