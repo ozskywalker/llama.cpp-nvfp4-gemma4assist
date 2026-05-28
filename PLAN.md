@@ -266,9 +266,23 @@ KNOWN LIMITATION: the SWA layer's accumulated KV isn't windowed; correct only wh
 seq_len <= sliding_window (1024). For longer contexts, feed only the last 1024 SWA positions
 (needs separate kv_len for full vs swa in the io/graph).
 
-Remaining: **framework/server integration** — fold spec_run.cpp into `common/speculative.cpp` as
-`COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` for llama-server (creating ctx_tgt with the
-KV-capture cb_eval), and SWA windowing for long context.
+### Phase C driver — llama-server integration WORKING
+`COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` ("draft-gemma4-assistant") in
+common/speculative.cpp runs end-to-end under llama-server (single-seq), lossless, at ~20-33%
+acceptance (matching the NVFP4-limited standalone). Run:
+`--model <31B> --model-draft <assistant f16> --spec-type draft-gemma4-assistant --parallel 1`.
+Enablers added: `llama_set_eval_callback` (persists cb_eval in cparams; the decode path re-applies
+it each build) to capture the backbone shared KV on the server's ctx_tgt; target GGUF path
+threaded through `common_params_speculative_draft`; draft-simple auto-enable suppressed when this
+type is selected; ctx_dft embeddings enabled for the host post_projection.
+
+Remaining acceptance levers (all near the NVFP4 ceiling; refinement, not blockers):
+- first prompt ubatch (pos0==0) captures no KV on reused/reserved graphs (acc trails n_past by a
+  couple positions) — needs the eval callback active on the graph-reuse path.
+- id_last/last_hidden off-by-one: the server samples the bonus then drafts immediately, so the
+  draft pairs embed(id_last) with the previous token's hidden (EAGLE/MTP-style) vs the assistant's
+  same-position training. Fully matching it needs forwarding id_last through the target first.
+- multi-sequence/continuous-batching (currently single-seq) and SWA windowing for ctx > 1024.
 
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
