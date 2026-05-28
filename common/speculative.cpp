@@ -948,7 +948,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             cap_clear();
             seeded = true;
         }
-        LOG_INF("g4a process: n_tokens=%d pos0=%d tok[0]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
+        LOG_DBG("g4a process: n_tokens=%d pos0=%d tok[0]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
                 n, batch_in.pos[0], batch_in.token[0], (int)(cap_kf.empty()?0:1), (int) seeded, acc_len);
         return true;
     }
@@ -956,7 +956,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     void draft(common_speculative_draft_params_vec & dparams) override {
         if (n_seq == 0) return;
         auto & dp = dparams[0];
-        LOG_INF("g4a draft: drafting=%d id_last=%d n_past=%d acc_len=%d have_hidden=%d\n",
+        LOG_DBG("g4a draft: drafting=%d id_last=%d n_past=%d acc_len=%d have_hidden=%d\n",
                 (int) dp.drafting, dp.id_last, dp.n_past, acc_len, (int) !last_hidden.empty());
         if (!dp.drafting || acc_len == 0 || last_hidden.empty()) return;
 
@@ -990,7 +990,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-        LOG_INF("g4a accept: seq=%d n_accepted=%d verify_n=%d acc_len(before)=%d\n",
+        LOG_DBG("g4a accept: seq=%d n_accepted=%d verify_n=%d acc_len(before)=%d\n",
                 (int) seq_id, (int) n_accepted, verify_n, acc_len);
         if (seq_id != 0 || verify_n <= 0 || cap_kf.empty()) { cap_clear(); return; }
         // verify batch = [id_last, draft_0, ..., draft_{K-1}]; n_accepted = accepted draft count.
