@@ -153,6 +153,16 @@ predictor that reuses FIXED backbone KV across all its steps:
       `llama_get_embeddings_pre_norm` path if it matches `hidden_states[-1]`, else add an API);
   (c) the target embedding table — to embed each drafted token in backbone (5376) space.
 
+**Verification oracle (DONE).** `devtools/gemma4_assistant/dump_hf_reference.py` runs the HF
+draft on synthetic-but-fixed inputs (no 62GB backbone needed — the forward is a pure function
+of inputs_embeds + shared_kv_states) and dumps inputs, outputs, AND per-layer intermediates to
+`hf_ref.npz`. The llama.cpp graph is gated by replaying identical inputs and diffing logits /
+last_hidden_state / per-layer activations. Empirical finding: for `q_len=1` with
+`kv_len < sliding_window`, `create_attention_masks` returns no mask (full attention over all
+KV) — and the draft loop always runs q_len=1, so the bidirectional/flipped-SWA mask (Risk 3) is
+NOT needed for normal operation until context exceeds the 1024 window. First gate uses q_len=1,
+small kv_len → pure cross-attention, no mask.
+
 **Implementation steps:**
 1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
    `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /
