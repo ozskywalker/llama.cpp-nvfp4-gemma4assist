@@ -850,8 +850,10 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     // backbone<->draft projections (model level, no block id)
-    ggml_tensor * mtp_pre_proj  = nullptr; // [2*n_embd_backbone, n_embd]
-    ggml_tensor * mtp_post_proj = nullptr; // [n_embd, n_embd_backbone]
+    ggml_tensor * mtp_pre_proj    = nullptr; // [2*n_embd_backbone, n_embd]
+    ggml_tensor * mtp_post_proj   = nullptr; // [n_embd, n_embd_backbone]
+    ggml_tensor * mtp_pre_proj_s  = nullptr; // NVFP4 weight_scale_2 (optional)
+    ggml_tensor * mtp_post_proj_s = nullptr; // NVFP4 weight_scale_2 (optional)
     ggml_tensor * mtp_centroids       = nullptr; // [n_embd, n_centroids] (ordered embeddings only)
     ggml_tensor * mtp_token_ordering  = nullptr; // [vocab_size] index buffer (ordered embeddings only)
 

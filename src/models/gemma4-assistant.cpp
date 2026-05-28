@@ -59,6 +59,9 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
     const int64_t n_embd_bb = hparams.n_embd_backbone;
     mtp_pre_proj  = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJ,  "weight"), {2*n_embd_bb, n_embd},  0);
     mtp_post_proj = create_tensor(tn(LLM_TENSOR_MTP_POST_PROJ, "weight"), {n_embd,      n_embd_bb}, 0);
+    // optional NVFP4 weight_scale_2 companions (the generic scale pass only covers per-layer tensors)
+    mtp_pre_proj_s  = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJ,  "scale"), {1}, TENSOR_NOT_REQUIRED);
+    mtp_post_proj_s = create_tensor(tn(LLM_TENSOR_MTP_POST_PROJ, "scale"), {1}, TENSOR_NOT_REQUIRED);
 
     if (hparams.use_ordered_embeddings) {
         mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_embd, (int64_t) hparams.n_centroids}, 0);
@@ -161,7 +164,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
     ggml_tensor * inp_pos = build_inp_pos();
 
     // pre_projection: [2*n_embd_backbone] -> [n_embd]
-    ggml_tensor * x = build_lora_mm(m.mtp_pre_proj, INP->embd, nullptr);
+    ggml_tensor * x = build_lora_mm(m.mtp_pre_proj, INP->embd, m.mtp_pre_proj_s);
     cb(x, "pre_projection", -1);
 
     for (int il = 0; il < n_layer; ++il) {
