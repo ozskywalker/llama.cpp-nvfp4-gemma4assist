@@ -276,13 +276,18 @@ it each build) to capture the backbone shared KV on the server's ctx_tgt; target
 threaded through `common_params_speculative_draft`; draft-simple auto-enable suppressed when this
 type is selected; ctx_dft embeddings enabled for the host post_projection.
 
+Long-context memory (DONE): sliding-attention layers are fed only the last `sliding_window`
+(1024) KV positions (io split into kv_len_full/kv_len_swa; no SWA mask needed), and KV inputs to
+the draft graph are F16. This makes 128K both correct and fit (SWA KV input collapses from ~GiB
+to ~MiB; full-layer KV input ~1 GiB f16). sliding_window hardcoded 1024 (TODO: read hparams.n_swa).
+
 Remaining acceptance levers (all near the NVFP4 ceiling; refinement, not blockers):
 - first prompt ubatch (pos0==0) captures no KV on reused/reserved graphs (acc trails n_past by a
   couple positions) — needs the eval callback active on the graph-reuse path.
 - id_last/last_hidden off-by-one: the server samples the bonus then drafts immediately, so the
   draft pairs embed(id_last) with the previous token's hidden (EAGLE/MTP-style) vs the assistant's
   same-position training. Fully matching it needs forwarding id_last through the target first.
-- multi-sequence/continuous-batching (currently single-seq) and SWA windowing for ctx > 1024.
+- multi-sequence/continuous-batching (currently single-seq).
 
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
