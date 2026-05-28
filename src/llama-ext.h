@@ -104,3 +104,28 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+//
+// gemma4_assistant speculative draft I/O (staging)
+//
+// The Gemma 4 Assistant draft head cross-attends over the *backbone's* KV states and consumes
+// projected backbone hidden states as input. The speculative driver fills these host buffers
+// from the target model and attaches them to the draft model before each llama_decode of the
+// draft. All pointers must stay valid until the decode completes. Layouts are ggml ne-order
+// (ne0 fastest). kv_len is the backbone sequence length being attended over.
+//
+// The graph outputs the post-norm hidden state (n_embd-wide) via the embeddings output; the
+// driver applies mtp.post_projection on the host to obtain the next backbone-space hidden state.
+struct llama_gemma4_assistant_io {
+    int32_t kv_len   = 0;
+    int32_t n_tokens = 0;
+    const float * embd   = nullptr; // [2*n_embd_backbone, n_tokens]
+    const float * k_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len]
+    const float * v_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len]
+    const float * k_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len]
+    const float * v_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len]
+};
+
+// attach (or clear, with io == nullptr) draft I/O to a gemma4_assistant model.
+// no-op for models of any other architecture.
+LLAMA_API void llama_gemma4_assistant_set_io(struct llama_model * model, const struct llama_gemma4_assistant_io * io);
