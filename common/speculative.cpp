@@ -840,14 +840,16 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     g4a_raw tok_embd;                 // backbone token_embd (raw, for embedding draft tokens)
     std::vector<float> post_f32;      // draft mtp.post_projection [n_embd_bb * n_embd_dft]
 
-    // shared KV captured from the target via cb_eval (accumulated within a decode, cleared per process)
+    // shared KV captured from the target via cb_eval (f32; accumulated within a decode)
     std::vector<float> cap_kf, cap_vf, cap_ks, cap_vs; int cap_seq = 0;
-    // accumulated full-sequence backbone shared KV
-    std::vector<float> acc_kf, acc_vf, acc_ks, acc_vs; int acc_len = 0;
+    // accumulated full-sequence backbone shared KV, stored as F16 (fed directly to the draft graph)
+    std::vector<ggml_fp16_t> acc_kf, acc_vf, acc_ks, acc_vs; int acc_len = 0;
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
     std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
-    int fpp_full = 0, fpp_swa = 0;    // floats per KV position (full / swa); set on first capture
+    int fpp_full = 0, fpp_swa = 0;    // elements per KV position (full / swa); set on first capture
+    int sliding_window = 1024;        // SWA window: only the last this-many sliding positions feed the draft
+                                      // TODO: read from the draft model's hparams.n_swa instead of hardcoding
 
     llama_gemma4_assistant_io io{};
 
@@ -875,11 +877,17 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         grab("Vcur_normed-" + std::to_string(layer_swa),  cap_vs);
     }
     void cap_clear() { cap_kf.clear(); cap_vf.clear(); cap_ks.clear(); cap_vs.clear(); cap_seq = 0; }
+    // append the first `count` f32 elements of src as F16 to dst
+    static void append_f16(std::vector<ggml_fp16_t> & dst, const std::vector<float> & src, size_t count) {
+        const size_t off = dst.size();
+        dst.resize(off + count);
+        for (size_t i = 0; i < count; ++i) dst[off + i] = ggml_fp32_to_fp16(src[i]);
+    }
     void acc_append() {
-        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.end());
-        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.end());
-        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.end());
-        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.end());
+        append_f16(acc_kf, cap_kf, cap_kf.size());
+        append_f16(acc_vf, cap_vf, cap_vf.size());
+        append_f16(acc_ks, cap_ks, cap_ks.size());
+        append_f16(acc_vs, cap_vs, cap_vs.size());
         acc_len = fpp_full > 0 ? (int) (acc_kf.size() / fpp_full) : 0; // derive: stays consistent with the data
     }
 
@@ -968,9 +976,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             g4a_row_f32(tok_embd, cur_tok, emb);
             memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
             memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
-            io.kv_len = acc_len; io.n_tokens = 1; io.embd = wide.data();
+            // full layers see the whole context; sliding layers see only the last `sliding_window`
+            const int kv_swa = std::min(acc_len, sliding_window);
+            const size_t off_swa = (size_t)(acc_len - kv_swa) * fpp_swa; // window offset into acc_swa
+            io.kv_len_full = acc_len; io.kv_len_swa = kv_swa; io.n_tokens = 1; io.embd = wide.data();
             io.k_full = acc_kf.data(); io.v_full = acc_vf.data();
-            io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
+            io.k_swa  = acc_ks.data() + off_swa; io.v_swa  = acc_vs.data() + off_swa;
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
             llama_memory_clear(llama_get_memory(params.ctx_dft), true);
@@ -999,10 +1010,10 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         const int commit  = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
         if (commit <= 0) { cap_clear(); return; }
         const size_t bf = (size_t) fpp_full, bs = (size_t) fpp_swa;
-        acc_kf.insert(acc_kf.end(), cap_kf.begin(), cap_kf.begin() + bf * commit);
-        acc_vf.insert(acc_vf.end(), cap_vf.begin(), cap_vf.begin() + bf * commit);
-        acc_ks.insert(acc_ks.end(), cap_ks.begin(), cap_ks.begin() + bs * commit);
-        acc_vs.insert(acc_vs.end(), cap_vs.begin(), cap_vs.begin() + bs * commit);
+        append_f16(acc_kf, cap_kf, bf * commit);
+        append_f16(acc_vf, cap_vf, bf * commit);
+        append_f16(acc_ks, cap_ks, bs * commit);
+        append_f16(acc_vs, cap_vs, bs * commit);
         acc_len = fpp_full > 0 ? (int)(acc_kf.size() / fpp_full) : acc_len;
         last_hidden.assign(verify_h.begin() + (size_t)(commit - 1) * n_embd_bb, verify_h.begin() + (size_t) commit * n_embd_bb);
         cap_clear();

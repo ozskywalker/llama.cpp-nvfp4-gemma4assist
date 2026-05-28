@@ -116,14 +116,19 @@ LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, 
 //
 // The graph outputs the post-norm hidden state (n_embd-wide) via the embeddings output; the
 // driver applies mtp.post_projection on the host to obtain the next backbone-space hidden state.
+//
+// KV is supplied as F16 (halves the on-GPU input vs f32). Full-attention layers see the whole
+// context (kv_len_full); sliding-attention layers see only the last kv_len_swa positions
+// (<= sliding_window), so feed only that window (no SWA mask is then needed).
 struct llama_gemma4_assistant_io {
-    int32_t kv_len   = 0;
-    int32_t n_tokens = 0;
-    const float * embd   = nullptr; // [2*n_embd_backbone, n_tokens]
-    const float * k_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len]
-    const float * v_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len]
-    const float * k_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len]
-    const float * v_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len]
+    int32_t kv_len_full = 0;  // full-attention KV length (full context)
+    int32_t kv_len_swa  = 0;  // sliding-attention KV length (== min(context, sliding_window))
+    int32_t n_tokens    = 0;
+    const float * embd   = nullptr; // [2*n_embd_backbone, n_tokens] (F32)
+    const void  * k_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len_full] (F16)
+    const void  * v_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len_full] (F16)
+    const void  * k_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len_swa]  (F16)
+    const void  * v_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len_swa]  (F16)
 };
 
 // attach (or clear, with io == nullptr) draft I/O to a gemma4_assistant model.
