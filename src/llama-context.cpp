@@ -1270,6 +1270,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        // the reuse path skips sched reset; still (re)apply the eval callback so it stays active on
+        // reused graphs (e.g. a callback installed after warmup/reserve, as the gemma4_assistant
+        // speculative driver does to capture the backbone shared KV). no-op when cb_eval is null.
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
         n_reused++;
     } else {
         res->reset();
