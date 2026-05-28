@@ -132,6 +132,9 @@ def main():
         pass
     for i, layer in enumerate(model.model.layers):
         hooks.append(layer.register_forward_hook(save_out(f"layer.{i}.out")))
+        # also capture each sub-module inside the layer to localize divergence
+        for cname, child in layer.named_children():
+            hooks.append(child.register_forward_hook(save_out(f"layer.{i}.{cname}.out")))
 
     print(f"[dump] forward: q_len={q_len} kv_len={kv_len} ...")
     with torch.no_grad():
