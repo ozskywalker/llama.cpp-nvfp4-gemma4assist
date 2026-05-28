@@ -932,17 +932,23 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // seed on the first batch (prompt): treat it as fully validated
         // TODO: confirm the framework's process/accept ordering under the server; subsequent
         // verify batches are committed in accept().
+        bool seeded = false;
         if (acc_len == 0) {
             acc_append();
             if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
             cap_clear(); // committed; next decode's capture starts fresh (accept() handles verify batches)
+            seeded = true;
         }
+        LOG_INF("g4a process: n_tokens=%d tok[0]=%d tok[last]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
+                n, batch_in.token[0], batch_in.token[n-1], (int)(cap_kf.empty()?0:1), (int) seeded, acc_len);
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         if (n_seq == 0) return;
         auto & dp = dparams[0];
+        LOG_INF("g4a draft: drafting=%d id_last=%d n_past=%d acc_len=%d have_hidden=%d\n",
+                (int) dp.drafting, dp.id_last, dp.n_past, acc_len, (int) !last_hidden.empty());
         if (!dp.drafting || acc_len == 0 || last_hidden.empty()) return;
 
         const llama_model * md = llama_get_model(params.ctx_dft);
@@ -975,6 +981,8 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        LOG_INF("g4a accept: seq=%d n_accepted=%d verify_n=%d acc_len(before)=%d\n",
+                (int) seq_id, (int) n_accepted, verify_n, acc_len);
         if (seq_id != 0 || verify_n <= 0) return;
         // commit the first n_accepted positions of the last verify batch to the accumulated KV.
         // TODO: confirm against the server whether the verify batch == drafts and how the bonus
