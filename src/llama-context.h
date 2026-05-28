@@ -61,6 +61,9 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // set the graph eval callback (persists across decodes; cparams is re-applied to the sched each build)
+    void set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data);
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;

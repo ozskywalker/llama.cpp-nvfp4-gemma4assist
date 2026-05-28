@@ -12,6 +12,7 @@
 //   /tmp/g4a_probe /models/huggingface/google-gemma-4-31B_NVFP4.gguf 99
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -62,10 +63,10 @@ int main(int argc, char ** argv) {
     cp.n_ctx   = 256;
     cp.n_batch = 64;
     cp.n_ubatch = 64;
-    cp.cb_eval = cb_eval;
-    cp.cb_eval_user_data = &cap;
+    // NOTE: deliberately NOT setting cp.cb_eval here -- test the post-creation setter instead
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "ctx failed\n"); return 1; }
+    llama_set_eval_callback(ctx, cb_eval, &cap); // <-- the API used by the server impl
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const char * prompt = "The quick brown fox jumps over the lazy dog.";
