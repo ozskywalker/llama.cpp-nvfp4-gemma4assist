@@ -199,21 +199,39 @@ hidden (argmax 17887 == HF). Reserve-time (io==null) falls back to kv_len=n_ctx 
 REMAINING: the speculative driver + target-KV extraction.
 
 **Implementation steps:**
-1. Inference graph (`src/models/gemma4-assistant.cpp::graph`): input embd width is 2*backbone;
-   `pre_projection` → per layer {attn_norm → Q=q_proj, q_norm, RoPE (proportional for full /
-   default for swa) → cross-attention over provided K/V (GQA: 32 Q heads over 16 swa / 4 full
-   KV heads, head_dim 256/512) with a bidirectional mask → wo, layer_output_scale, post_attn
-   norm, residual → ffn (gelu, pre/post norm), residual} → output_norm → both `post_projection`
-   (as embeddings output) and `lm_head` logits. NOTE: backbone K/V must arrive as graph inputs.
-2. KV/hidden/embedding extraction API (new `llama-ext.h` surface): read the target's K/V for the
-   two layer types and its final hidden state; expose target `get_rows` on tok_embd (or run a
-   tiny target embed). This is the bulk of the novel infrastructure.
-3. `common/common.h`: add `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`.
-4. `common/speculative.cpp`: impl modeled on `common_speculative_impl_draft_mtp` (`:409`),
-   implementing the loop above (`process`/`draft`/`accept`, `need_embd_pre_norm()`), feeding the
-   draft `ctx_dft` via `batch.embd` of width 2*backbone and injecting the fixed backbone KV.
-5. Wire CLI/server flags so `draft-gemma4-assistant` is selectable with `--model` (Gemma 4
-   backbone) + `--model-draft` (this GGUF).
+1. Inference graph (`build_arch_graph`): ✅ DONE & GPU-verified (see above).
+2. Input plumbing (`llama_gemma4_assistant_set_io` + graph input): ✅ DONE & verified.
+
+### Phase C driver — DE-RISKED DESIGN (remaining work; GPU-iterated)
+Every mechanism is identified and the verifiable ones are checked. Implement in
+`common/speculative.cpp` as a new impl + type (`COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`
+in common.h; update the name map, `type_to_str`, the `static_assert(...==9)`→10, the enable
+logic ~`:1330`, and the dispatch switch ~`:1386`). The AR loop (per the resolved data flow):
+
+- **Seed** (in `process()`, after the target decodes): `last_hidden` = target final hidden of
+  the last validated token via `llama_get_embeddings_pre_norm_ith` (reuse the MTP path; set
+  `need_embd_pre_norm()`=true). VALIDATE on GPU that this equals HF `hidden_states[-1]` (pre- vs
+  post-final-norm); if it's the post-norm one, use `llama_get_embeddings_ith`.
+- **Target shared KV** (the only genuinely new infra): register a `cb_eval` callback
+  (llama_context_params.cb_eval) on the *target* context that captures the backbone's
+  `Kcur_pos` (post-RoPE K) and `Vcur_normed` (V) at the **last full-attention** and **last
+  sliding-attention** layers (the layers feeding `n_layer_kv_from_start`), copied GPU→host.
+  These become io.k_full/v_full and io.k_swa/v_swa. NOTE: cb_eval is set at target-context
+  creation, so the server must create ctx_tgt with this callback (a setup wrinkle to handle).
+- **Target embed**: each draft step needs `target_embed(last_token)` (backbone 5376-dim). Add a
+  small API to read backbone `token_embd` rows (get_rows) into host, or fold via a tiny target
+  graph. Concat with `last_hidden` → io.embd (width 2*backbone).
+- **Draft step**: `llama_gemma4_assistant_set_io(draft, &io)` → `llama_decode(ctx_dft, batch)`
+  (batch carries position=[len-1+i]; token unused) → `logits` (argmax = next draft token) →
+  embeddings = post-norm hidden (1024) → host `post_projection` (VERIFIED: `nrm @ post.T`,
+  rel 4e-7; for an NVFP4 draft, dequantize post_projection first, or run the draft at f16/Q8_0
+  since it's only ~940MB) → next `last_hidden` (5376). Repeat K times.
+3. Wire CLI/server flags so `draft-gemma4-assistant` is selectable with `--model` (Gemma 4
+   backbone) + `--model-draft` (this GGUF), incl. creating ctx_tgt with the KV-capture cb_eval.
+
+Verified driver building blocks: draft decode (GPU, rel ~1.7e-3), host post_projection
+(rel 4e-7). Remaining is the framework integration + target KV/embed extraction, validated
+end-to-end by acceptance rate / lossless output against the live 31B target.
 
 ### Phase D — Quantize to NVFP4
 Deliverable: NVFP4 GGUF that loads and runs on Blackwell.
