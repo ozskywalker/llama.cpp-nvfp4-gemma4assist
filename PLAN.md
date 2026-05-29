@@ -366,3 +366,57 @@ from quantization; spot-check `llama-quantize <f16> <nvfp4> NVFP4` output loads.
    acceptance rate + tokens/s speedup on the Blackwell GPU.
 5. Build with CUDA Blackwell enabled; confirm native FP4 kernels are used (no CPU dequant
    fallback) for the NVFP4 weights.
+
+### Phase E — KV-cache backfill (caching + speculation together)  [SCOPED, not implemented]
+
+**Context.** The driver builds the backbone shared KV only from the `cb_eval` callback, which
+fires for *decoded* tokens. When the server serves a prompt prefix from its prompt-cache
+(`--cache-ram`) or context-checkpoint (`--ctx-checkpoints`), those positions are restored into
+the target KV **without** being decoded, so `cb_eval` misses them and `acc_len` lags the target
+(`pos0 > acc_len`). Today the driver detects this and *pauses* drafting (commit `6db18160a`) —
+correct + lossless but no speedup until a fresh prompt. Workaround: run with `--cache-ram 0
+--ctx-checkpoints 0`. This phase makes caching + speculation coexist by backfilling the missing
+KV from the target's own cache.
+
+**Verified premise.** `build_attn` stores into the cache exactly the tensors `cb_eval` captures:
+`Kcur_pos` (post-RoPE, post-k-norm K) and `Vcur_normed` (rms-normed V), `src/models/gemma4.cpp:226-239`.
+So the cache *is* the right source; we just need to read it.
+
+**Approach.** On a gap (`pos0 > acc_len`) in `process()`, read the target KV cache for the shared
+layers over `[acc_len, pos0)`, dequantize to f32, and `commit()` it (advancing `acc_len` to `pos0`);
+the current decode's `cb_eval` capture then commits on top. Drafting resumes aligned.
+
+**Components.**
+1. **Staging read API** (`src/llama-ext.h` + `src/llama-context.cpp`):
+   `int llama_kv_read_layer_f32(ctx, int il, llama_seq_id, llama_pos p0, llama_pos p1, float * k_out, float * v_out)`.
+   Implemented against the memory/`llama_kv_cache` internals (model the copy on `state_write_data`,
+   `src/llama-kv-cache.cpp:1969-2066`). Returns #positions read (may be < p1-p0 for SWA layers
+   whose window has scrolled past). Per position: K row = `[n_embd_head_k, n_head_kv]`, V row =
+   `[n_embd_head_v, n_head_kv]` in ne-order — already the layout the draft `io`/`commit()` expects.
+2. **Driver backfill** (`common/speculative.cpp`): in `process()` replace the `pos0 > acc_len` warn
+   with a backfill: call the API for `layer_full` and `layer_swa` over `[acc_len, pos0)`, f32→f16,
+   `commit(npos, k_full, v_full, k_swa, v_swa)`. SWA only needs the last `sliding_window`; cap reads.
+
+**Obstacles (ranked).**
+- **iSWA routing.** Target uses an iSWA cache: `layer_full` (59) lives in the base cache, `layer_swa`
+  (58) in the SWA sub-cache (`src/llama-kv-cache-iswa.cpp`). The API must pick the sub-cache via
+  `hparams.is_swa(il)`. The SWA sub-cache only holds ~`n_swa` recent positions — fine (that's all we
+  feed) but reads of older gap positions for the SWA layer will (correctly) return fewer rows.
+- **Layer remap.** Use `map_layer_ids[il]` (`src/llama-kv-cache.cpp:224,247`) to get the physical
+  cache-layer index (shared-KV layers reuse earlier slots).
+- **Dequant.** Cache dtype = `cache_type_k/v` (q8_0/q5_1/…); copy raw via `ggml_backend_tensor_get`
+  then dequantize with the ggml row dequantizers. (cb_eval was full-precision f32 pre-quant, so
+  backfilled positions are ~1 quant-step noisier — acceptable for the restored prefix.)
+- **V transpose.** If `v_trans` (no-FA path), V is `[kv_size, …]` per element → gather per embd dim
+  (`src/llama-kv-cache.cpp:1189-1194,2059`); if FA/`!v_trans`, V row is contiguous like K. Handle both.
+- **pos→cell lookup.** No direct finder; one O(kv_size) pass over `v_cells[stream]`
+  (`src/llama-kv-cells.h`) to build a `pos→cell` map for the gap range (one-time per gap, cheap).
+
+**Effort/risk.** ~1–2 days. Main risk is the read API correctness (layout/transpose/dequant/iSWA);
+de-risk by a unit gate that captures one position via *both* `cb_eval` and the read API and asserts
+they match to ~1e-2 (f32 vs quant). Then end-to-end: acceptance with caching ON should match the
+`--cache-ram 0 --ctx-checkpoints 0` baseline (~14%).
+
+**Alternative (cheaper, considered & rejected):** force re-decode of the gap — defeats the caching
+speedup and the driver can't drive the server's decode loop. The cache read is the only way to keep
+both.
