@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <unistd.h>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -785,6 +786,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 // Lifecycle details (process/accept semantics under continuous batching) are to be tuned against
 // a running llama-server. Known first-cut assumptions are flagged with TODO.
 namespace {
+// resident set size (anonymous + file), MiB -- for leak diagnosis
+static double g4a_rss_mb() {
+    FILE * f = fopen("/proc/self/statm", "r");
+    if (!f) return -1.0;
+    long size = 0, resident = 0;
+    if (fscanf(f, "%ld %ld", &size, &resident) != 2) { fclose(f); return -1.0; }
+    fclose(f);
+    return resident * (double) sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+}
+
 struct g4a_raw { std::vector<uint8_t> bytes; enum ggml_type type = GGML_TYPE_F32; int64_t ne[4] = {1,1,1,1}; };
 
 static g4a_raw g4a_load_raw(const std::string & path, const std::string & name) {
@@ -850,6 +861,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     // sliding-layer KV: host F16, windowed feed each step (small)
     std::vector<ggml_fp16_t> acc_ks, acc_vs;
     int acc_len = 0;                  // committed positions (full == swa)
+    // verify-decode capture handed from process() to accept() (small: one verify batch). process()
+    // always consumes+clears cap, so cap can never survive a call -> leak-proof even if accept() is
+    // skipped (e.g. the server's checkpoint-restore path bypasses common_speculative_accept()).
+    std::vector<float> vbuf_kf, vbuf_vf, vbuf_ks, vbuf_vs;
+    bool expect_accept = false;       // true iff the last draft() drafted tokens => next process() is a verify decode
+    int dbg_cycles = 0;               // draft() invocation counter (for periodic mem logging)
+    int dbg_proc = 0;                 // process() invocation counter (for periodic mem logging)
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
     std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
@@ -896,9 +914,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         kv_ctx = ggml_init(p);
         dev_k_full = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F16, dev_hd_full, dev_nkv_full, max_ctx);
         dev_v_full = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F16, dev_hd_full, dev_nkv_full, max_ctx);
-        kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, llama_context_dev_buft(params.ctx_dft));
-        LOG_INF("%s: gemma4_assistant device full-KV [%d,%d,%d] x2 = %.1f MiB\n", __func__,
-                dev_hd_full, dev_nkv_full, max_ctx, 2.0 * dev_hd_full * dev_nkv_full * max_ctx * 2 / (1024.0*1024.0));
+        ggml_backend_buffer_type_t buft = llama_context_dev_buft(params.ctx_dft);
+        kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, buft);
+        LOG_INF("%s: gemma4_assistant device full-KV [%d,%d,%d] x2 = %.1f MiB on buft '%s' (host=%d) max_ctx=%d rss=%.0f MiB\n",
+                __func__, dev_hd_full, dev_nkv_full, max_ctx,
+                2.0 * dev_hd_full * dev_nkv_full * max_ctx * 2 / (1024.0*1024.0),
+                buft ? ggml_backend_buft_name(buft) : "<null>",
+                buft ? (int) ggml_backend_buft_is_host(buft) : -1, max_ctx, g4a_rss_mb());
     }
     // write `npos` positions of `src` (f32) starting at `pos0` into device tensor `dev` (F16)
     void dev_set(ggml_tensor * dev, const std::vector<float> & src, int pos0, int npos) {
@@ -907,15 +929,16 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         ggml_backend_tensor_set(dev, tmp.data(), (size_t) pos0 * fpp_full * sizeof(ggml_fp16_t), tmp.size() * sizeof(ggml_fp16_t));
     }
     // commit the first `npos` captured positions: full -> device (append), swa -> host (append)
-    void commit(int npos) {
+    void commit(int npos, const std::vector<float> & src_kf, const std::vector<float> & src_vf,
+                          const std::vector<float> & src_ks, const std::vector<float> & src_vs) {
         if (npos <= 0) return;
         ensure_dev();
         if (dev_k_full && acc_len + npos <= max_ctx) {
-            dev_set(dev_k_full, cap_kf, acc_len, npos);
-            dev_set(dev_v_full, cap_vf, acc_len, npos);
+            dev_set(dev_k_full, src_kf, acc_len, npos);
+            dev_set(dev_v_full, src_vf, acc_len, npos);
         }
-        append_f16(acc_ks, cap_ks, (size_t) npos * fpp_swa);
-        append_f16(acc_vs, cap_vs, (size_t) npos * fpp_swa);
+        append_f16(acc_ks, src_ks, (size_t) npos * fpp_swa);
+        append_f16(acc_vs, src_vs, (size_t) npos * fpp_swa);
         acc_len += npos;
     }
 
@@ -925,7 +948,9 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     {
         GGML_ASSERT(params.ctx_tgt && params.ctx_dft && "gemma4_assistant requires ctx_tgt and ctx_dft");
         if (n_seq != 1) {
-            LOG_WRN("%s: FIRST CUT supports single-sequence only (n_seq=%u); multi-seq is TODO\n", __func__, n_seq);
+            LOG_ERR("%s: the gemma4_assistant draft is single-sequence only; got n_seq=%u. "
+                    "Relaunch the server with --parallel 1 (multi-sequence support is TODO).\n", __func__, n_seq);
+            throw std::runtime_error("gemma4_assistant speculative draft requires --parallel 1 (n_seq must be 1)");
         }
         const llama_model * mt = llama_get_model(params.ctx_tgt);
         const llama_model * md = llama_get_model(params.ctx_dft);
@@ -959,6 +984,8 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // device full-KV buffer is reused (overwritten from position 0); just reset the length
         acc_ks.clear(); acc_vs.clear(); acc_len = 0;
         last_hidden.clear(); cap_clear();
+        vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear();
+        expect_accept = false;
     }
     ~common_speculative_impl_draft_gemma4_assistant() override {
         if (kv_buf) ggml_backend_buffer_free(kv_buf);
@@ -977,24 +1004,37 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             if (h) memcpy(verify_h.data() + (size_t) i * n_embd_bb, h, (size_t) n_embd_bb * sizeof(float));
         }
         if (fpp_full == 0 && !cap_kf.empty()) { fpp_full = (int)(cap_kf.size() / n); fpp_swa = (int)(cap_ks.size() / n); }
-        // commit prompt/prefill decodes directly (no accept() follows them); only seed when KV was
-        // actually captured this decode (a capture-empty decode would otherwise desync acc_len).
-        // TODO: capture can still be empty on reused-graph decodes; subsequent verify batches are
-        // committed via accept(). The off-by-one between id_last and last_hidden is the remaining
-        // acceptance lever.
+        // Two kinds of decode reach process():
+        //  - verify decode  (expect_accept): batch = [id_last, draft_0..]; accept() will commit the
+        //    validated prefix. Hand this capture to accept() via vbuf_*.
+        //  - prompt/prefill decode (!expect_accept): ground-truth tokens with no accept() following
+        //    (initial seed OR a continuation re-prefill). Commit directly here.
+        // Either way cap_* is ALWAYS consumed and cleared below, so it can never accumulate across
+        // decodes/requests (the source of the host-RAM OOM).
         bool seeded = false;
-        if (acc_len == 0 && !cap_kf.empty()) {
-            commit(verify_n);
+        if (expect_accept) {
+            vbuf_kf.swap(cap_kf); vbuf_vf.swap(cap_vf); vbuf_ks.swap(cap_ks); vbuf_vs.swap(cap_vs);
+        } else if (!cap_kf.empty()) {
+            commit(verify_n, cap_kf, cap_vf, cap_ks, cap_vs);
             if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
-            cap_clear();
             seeded = true;
         }
-        LOG_DBG("g4a process: n_tokens=%d pos0=%d tok[0]=%d cap_kf_pos=%d seeded=%d acc_len=%d\n",
-                n, batch_in.pos[0], batch_in.token[0], (int)(cap_kf.empty()?0:1), (int) seeded, acc_len);
+        const double mb = 1.0 / (1024.0 * 1024.0);
+        const double cap_mb = (cap_kf.size()+cap_vf.size()+cap_ks.size()+cap_vs.size())*4*mb; // this decode's capture (pre-clear)
+        cap_clear(); // leak-proof: cap never survives a process() call
+        LOG_DBG("g4a process: n_tokens=%d pos0=%d tok[0]=%d expect_accept=%d seeded=%d acc_len=%d\n",
+                n, batch_in.pos[0], batch_in.token[0], (int) expect_accept, (int) seeded, acc_len);
+        if (cap_mb > 256.0 || (++dbg_proc & 255) == 0) {
+            LOG_INF("g4a mem[proc=%d n=%d pos0=%d]: rss=%.0f MiB acc_len=%d | cap(this decode)=%.1f MiB | vbuf=%.1f MiB | acc_ks/vs=%.1f/%.1f MiB | verify_h=%.1f MiB\n",
+                    dbg_proc, n, batch_in.pos[0], g4a_rss_mb(), acc_len, cap_mb,
+                    (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb,
+                    acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb, verify_h.size()*4*mb);
+        }
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        expect_accept = false; // no draft => no verify decode => next process() is a prompt decode
         if (n_seq == 0) return;
         auto & dp = dparams[0];
         LOG_DBG("g4a draft: drafting=%d id_last=%d n_past=%d acc_len=%d have_hidden=%d\n",
@@ -1030,22 +1070,33 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             for (int o = 0; o < n_embd_bb; ++o) { const float * w = post_f32.data() + (size_t) o * n_embd_dft; float s = 0; for (int i = 0; i < n_embd_dft; ++i) s += dn[i] * w[i]; nrm[o] = s; }
             cur_h = nrm; cur_tok = dtok;
             dp.result->push_back(dtok);
+            expect_accept = true; // drafted at least one token => the next decode is a verify decode
             llama_batch_free(b);
+        }
+        if ((++dbg_cycles & 63) == 0) {
+            const double mb = 1.0 / (1024.0 * 1024.0);
+            LOG_INF("g4a mem[cyc=%d]: rss=%.0f MiB acc_len=%d | acc_ks/vs=%.1f/%.1f MiB | vbuf=%.1f MiB | verify_h=%.1f MiB\n",
+                    dbg_cycles, g4a_rss_mb(), acc_len,
+                    acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb,
+                    (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb, verify_h.size()*4*mb);
         }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         LOG_DBG("g4a accept: seq=%d n_accepted=%d verify_n=%d acc_len(before)=%d\n",
                 (int) seq_id, (int) n_accepted, verify_n, acc_len);
-        if (seq_id != 0 || verify_n <= 0 || cap_kf.empty()) { cap_clear(); return; }
+        expect_accept = false; // verify decode consumed
+        // accept() commits the verify-decode capture that process() stashed in vbuf_* (cap is already cleared).
+        if (seq_id != 0 || verify_n <= 0 || vbuf_kf.empty()) { vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear(); return; }
         // verify batch = [id_last, draft_0, ..., draft_{K-1}]; n_accepted = accepted draft count.
         // validated this cycle = id_last + n_accepted drafts => commit (n_accepted + 1) positions.
-        const int cap_pos  = fpp_full > 0 ? (int)(cap_kf.size() / fpp_full) : verify_n;
+        const int cap_pos  = fpp_full > 0 ? (int)(vbuf_kf.size() / fpp_full) : verify_n;
         const int n_commit = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
-        if (n_commit <= 0) { cap_clear(); return; }
-        last_hidden.assign(verify_h.begin() + (size_t)(n_commit - 1) * n_embd_bb, verify_h.begin() + (size_t) n_commit * n_embd_bb);
-        commit(n_commit); // full -> device, swa -> host; advances acc_len
-        cap_clear();
+        if (n_commit > 0) {
+            last_hidden.assign(verify_h.begin() + (size_t)(n_commit - 1) * n_embd_bb, verify_h.begin() + (size_t) n_commit * n_embd_bb);
+            commit(n_commit, vbuf_kf, vbuf_vf, vbuf_ks, vbuf_vs); // full -> device, swa -> host; advances acc_len
+        }
+        vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear();
     }
 
     bool need_embd() const override { return true; } // post-norm backbone hidden
