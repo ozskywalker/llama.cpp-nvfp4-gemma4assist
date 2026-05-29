@@ -858,6 +858,10 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     ggml_backend_buffer_t kv_buf = nullptr;
     ggml_tensor * dev_k_full = nullptr, * dev_v_full = nullptr;
     int dev_hd_full = 0, dev_nkv_full = 0, max_ctx = 0;
+    // full-layer KV host fallback (validated path): set_input-copied to the draft each decode.
+    // Selected unless G4A_DEVICE_KV=1; the device-view path (#1) is faster but unproven on GPU.
+    bool use_host_kv = true;
+    std::vector<ggml_fp16_t> acc_kf, acc_vf;
     // sliding-layer KV: host F16, windowed feed each step (small)
     std::vector<ggml_fp16_t> acc_ks, acc_vs;
     int acc_len = 0;                  // committed positions (full == swa)
@@ -867,7 +871,9 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     std::vector<float> vbuf_kf, vbuf_vf, vbuf_ks, vbuf_vs;
     bool expect_accept = false;       // true iff the last draft() drafted tokens => next process() is a verify decode
     int dbg_cycles = 0;               // draft() invocation counter (for periodic mem logging)
+    int dbg_cycles_prev = 0;          // dbg_cycles at last timing flush
     int dbg_proc = 0;                 // process() invocation counter (for periodic mem logging)
+    int64_t t_draft_us = 0, t_decode_us = 0, t_post_us = 0; int n_draft_steps = 0; // per-interval timing
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
     std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
@@ -928,14 +934,20 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = ggml_fp32_to_fp16(src[i]);
         ggml_backend_tensor_set(dev, tmp.data(), (size_t) pos0 * fpp_full * sizeof(ggml_fp16_t), tmp.size() * sizeof(ggml_fp16_t));
     }
-    // commit the first `npos` captured positions: full -> device (append), swa -> host (append)
+    // commit the first `npos` captured positions: full -> host or device (append), swa -> host (append)
     void commit(int npos, const std::vector<float> & src_kf, const std::vector<float> & src_vf,
                           const std::vector<float> & src_ks, const std::vector<float> & src_vs) {
         if (npos <= 0) return;
-        ensure_dev();
-        if (dev_k_full && acc_len + npos <= max_ctx) {
-            dev_set(dev_k_full, src_kf, acc_len, npos);
-            dev_set(dev_v_full, src_vf, acc_len, npos);
+        if (use_host_kv) {
+            // full-layer KV accumulates complete in host F16 (fed via set_input each decode)
+            append_f16(acc_kf, src_kf, (size_t) npos * fpp_full);
+            append_f16(acc_vf, src_vf, (size_t) npos * fpp_full);
+        } else {
+            ensure_dev();
+            if (dev_k_full && acc_len + npos <= max_ctx) {
+                dev_set(dev_k_full, src_kf, acc_len, npos);
+                dev_set(dev_v_full, src_vf, acc_len, npos);
+            }
         }
         append_f16(acc_ks, src_ks, (size_t) npos * fpp_swa);
         append_f16(acc_vs, src_vs, (size_t) npos * fpp_swa);
@@ -977,8 +989,11 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         llama_set_eval_callback(params.ctx_tgt, cb_eval, this); // install backbone KV capture
         llama_set_embeddings(params.ctx_dft, true); // draft outputs the post-norm hidden (for host post_projection)
 
-        LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d\n",
-                __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa);
+        const char * host_env = getenv("G4A_HOST_KV");
+        use_host_kv = host_env && atoi(host_env) != 0; // default: device-view path (faster, validated equal acceptance); G4A_HOST_KV=1 for the host fallback
+
+        LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d full-KV path=%s\n",
+                __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa, use_host_kv ? "host" : "device");
     }
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
@@ -988,10 +1003,25 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
 
     void reset_state() {
         // device full-KV buffer is reused (overwritten from position 0); just reset the length
-        acc_ks.clear(); acc_vs.clear(); acc_len = 0;
+        acc_kf.clear(); acc_vf.clear(); acc_ks.clear(); acc_vs.clear(); acc_len = 0;
         last_hidden.clear(); cap_clear();
         vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear();
         expect_accept = false;
+    }
+
+    // Rewind committed KV to position `p` (< acc_len). Happens when the server reuses a cached prefix
+    // and starts a new task at pos0 < acc_len (LCP slot reuse) or restores a speculative checkpoint.
+    // The full-layer KV for positions [0,p) is still valid (same tokens); drop the divergent tail so
+    // the draft's RoPE positions / KV stay aligned with the target (else acc_len drifts ahead of pos0
+    // and acceptance collapses). The SWA window is cleared and refills from the re-prefill.
+    void truncate_to(int p) {
+        if (p < 0 || p >= acc_len) return;
+        acc_len = p;
+        if (use_host_kv) { acc_kf.resize((size_t) p * fpp_full); acc_vf.resize((size_t) p * fpp_full); }
+        acc_ks.clear(); acc_vs.clear(); // SWA window refills from the re-prefill (kv_len_swa derives from buffer)
+        expect_accept = false;
+        // device full-KV [0,p) stays valid; [p,..) is overwritten as the re-prefill re-commits.
+        // last_hidden is refreshed by the re-prefill's commit (a prompt decode).
     }
     ~common_speculative_impl_draft_gemma4_assistant() override {
         if (kv_buf) ggml_backend_buffer_free(kv_buf);
@@ -1001,7 +1031,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0 || batch_in.token == nullptr || batch_in.embd != nullptr) { cap_clear(); return true; }
         const int n = batch_in.n_tokens;
-        if (batch_in.pos[0] == 0) { reset_state(); } // new sequence (fresh prompt)
+        const int pos0 = batch_in.pos[0];
+        // The batch position is authoritative: pos0 == #confirmed tokens (pos_next()). Keep acc_len
+        // aligned to it. pos0==0 -> fresh sequence; pos0<acc_len -> prefix reuse / checkpoint restore
+        // rewind. (pos0>acc_len would be a capture gap we can't backfill -> warn; shouldn't happen.)
+        if (pos0 == 0)            { reset_state(); }
+        else if (pos0 < acc_len)  { LOG_DBG("g4a rewind: pos0=%d < acc_len=%d (prefix reuse); truncating\n", pos0, acc_len); truncate_to(pos0); }
+        else if (pos0 > acc_len)  { LOG_WRN("g4a: pos0=%d > acc_len=%d (capture gap); draft KV may be misaligned\n", pos0, acc_len); }
         verify_n = n;
         // store per-position post-norm hidden (HF hidden_states[-1]) for accept()
         verify_h.resize((size_t) n * n_embd_bb);
@@ -1051,6 +1087,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         llama_token cur_tok = dp.id_last;
         std::vector<float> cur_h = last_hidden;
         std::vector<float> emb, wide(2 * n_embd_bb), nrm;
+        const int64_t t_call0 = ggml_time_us();
         for (int k = 0; k < params.n_max; ++k) {
             g4a_row_f32(tok_embd, cur_tok, emb);
             memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
@@ -1058,33 +1095,48 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             // full layers see the whole context (device-resident, viewed); sliding layers see only
             // the last `sliding_window` positions, which is exactly what acc_ks/vs now hold (windowed
             // in commit()), so feed the whole buffer from offset 0.
-            const int kv_swa = std::min(acc_len, sliding_window);
+            // kv_len_swa = positions actually held in acc_ks (== min(acc_len, sliding_window) in steady
+            // state, but smaller right after a truncate_to() rewind until the window refills -- using the
+            // buffer count keeps the graph view in-bounds).
+            const int kv_swa = fpp_swa > 0 ? (int)(acc_ks.size() / fpp_swa) : 0;
             io.kv_len_full = acc_len; io.kv_len_swa = kv_swa; io.n_tokens = 1; io.embd = wide.data();
-            io.dev_k_full = dev_k_full; io.dev_v_full = dev_v_full;
+            if (use_host_kv) { io.dev_k_full = nullptr;    io.dev_v_full = nullptr;    io.k_full = acc_kf.data(); io.v_full = acc_vf.data(); }
+            else             { io.dev_k_full = dev_k_full; io.dev_v_full = dev_v_full; io.k_full = nullptr;       io.v_full = nullptr; }
             io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
+            const int64_t td0 = ggml_time_us();
             llama_memory_clear(llama_get_memory(params.ctx_dft), true);
             llama_batch b = llama_batch_init(1, 0, 1);
             b.n_tokens = 1; b.token[0] = 0; b.pos[0] = acc_len - 1; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
             if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); break; }
             const float * dl = llama_get_logits_ith(params.ctx_dft, 0);
+            const int64_t td1 = ggml_time_us();
             llama_token dtok = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dtok]) dtok = v;
             const float * dn = llama_get_embeddings_ith(params.ctx_dft, 0); // post-norm hidden [n_embd_dft]
             // host post_projection: out[o] = sum_i dn[i] * post_f32[o*n_embd_dft + i]
             nrm.assign(n_embd_bb, 0.0f);
             for (int o = 0; o < n_embd_bb; ++o) { const float * w = post_f32.data() + (size_t) o * n_embd_dft; float s = 0; for (int i = 0; i < n_embd_dft; ++i) s += dn[i] * w[i]; nrm[o] = s; }
+            const int64_t td2 = ggml_time_us();
+            t_decode_us += td1 - td0; t_post_us += td2 - td1; n_draft_steps++;
             cur_h = nrm; cur_tok = dtok;
             dp.result->push_back(dtok);
             expect_accept = true; // drafted at least one token => the next decode is a verify decode
             llama_batch_free(b);
         }
+        t_draft_us += ggml_time_us() - t_call0;
         if ((++dbg_cycles & 63) == 0) {
             const double mb = 1.0 / (1024.0 * 1024.0);
-            LOG_INF("g4a mem[cyc=%d]: rss=%.0f MiB acc_len=%d | acc_ks/vs=%.1f/%.1f MiB | vbuf=%.1f MiB | verify_h=%.1f MiB\n",
-                    dbg_cycles, g4a_rss_mb(), acc_len,
+            const double ic = 1.0 / 1000.0 / std::max(1, dbg_cycles - dbg_cycles_prev); // ms per draft() call
+            const double is = 1.0 / 1000.0 / std::max(1, n_draft_steps);                // ms per draft step
+            LOG_INF("g4a mem[cyc=%d]: rss=%.0f MiB acc_len=%d kv=%s | acc_kf/vf=%.1f/%.1f MiB | acc_ks/vs=%.1f/%.1f MiB | vbuf=%.1f MiB\n",
+                    dbg_cycles, g4a_rss_mb(), acc_len, use_host_kv ? "host" : "dev",
+                    acc_kf.size()*sizeof(ggml_fp16_t)*mb, acc_vf.size()*sizeof(ggml_fp16_t)*mb,
                     acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb,
-                    (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb, verify_h.size()*4*mb);
+                    (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb);
+            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms post_proj=%.2f ms (n_step=%d)\n",
+                    dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps);
+            t_draft_us = t_decode_us = t_post_us = 0; n_draft_steps = 0; dbg_cycles_prev = dbg_cycles;
         }
     }
 
