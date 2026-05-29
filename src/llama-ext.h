@@ -147,3 +147,13 @@ LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_
 // buffer type of the context's primary compute backend -- for allocating persistent device
 // tensors a graph can view (e.g. the gemma4_assistant draft's resident full-layer KV).
 LLAMA_API ggml_backend_buffer_type_t llama_context_dev_buft(struct llama_context * ctx);
+
+// Read stored K/V for model layer `il`, sequence `seq_id`, positions [p0, p1) into host f32
+// (dequantized; one [n_embd_k_gqa] / [n_embd_v_gqa] vector per position, ascending; caller zero-inits
+// for any positions not present). Returns #positions found, or -1 if unsupported (transposed V, i.e.
+// no flash-attention; or layer/seq invalid). Used by the gemma4_assistant speculative driver to
+// backfill the backbone shared KV the server restored from prompt-cache / context-checkpoint /
+// LCP-slot-reuse without re-decoding (so cb_eval never captured it). Requires flash-attention on the
+// source context (so V is stored non-transposed).
+LLAMA_API int32_t llama_kv_read_layer_f32(struct llama_context * ctx, int32_t il, llama_seq_id seq_id,
+                                          llama_pos p0, llama_pos p1, float * k_out, float * v_out);

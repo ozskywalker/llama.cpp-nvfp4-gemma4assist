@@ -1022,6 +1022,34 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // device full-KV [0,p) stays valid; [p,..) is overwritten as the re-prefill re-commits.
         // last_hidden is refreshed by the re-prefill's commit (a prompt decode).
     }
+
+    // Backfill the shared KV for positions [acc_len, p1) by reading the TARGET's KV cache (layers
+    // layer_full / layer_swa). Needed when the server restored those positions (prompt-cache /
+    // context-checkpoint / LCP slot reuse) without re-decoding them, so cb_eval never captured them
+    // and acc_len lags pos0. The full-attention layer (whole context) MUST be fully recovered or we
+    // can't align -> leave the gap (drafting stays paused). SWA only needs the recent window; the
+    // SWA cache holds just the last ~n_swa positions, so older rows come back zero and commit()'s
+    // window-trim discards them. Requires the target to run with flash-attention (non-transposed V).
+    void backfill_gap(int p1) {
+        const int gap = p1 - acc_len;
+        if (gap <= 0 || fpp_full == 0) return;
+        const int base = acc_len;
+        std::vector<float> kf((size_t) gap * fpp_full, 0.0f), vf((size_t) gap * fpp_full, 0.0f);
+        std::vector<float> ks((size_t) gap * fpp_swa,  0.0f), vs((size_t) gap * fpp_swa,  0.0f);
+        const int nf = llama_kv_read_layer_f32(params.ctx_tgt, layer_full, 0, base, p1, kf.data(), vf.data());
+        const int ns = llama_kv_read_layer_f32(params.ctx_tgt, layer_swa,  0, base, p1, ks.data(), vs.data());
+        if (nf != gap) {
+            if ((dbg_gap++ & 63) == 0) {
+                LOG_WRN("g4a: KV backfill incomplete (full layer %d: %d/%d, nf=%d) -- drafting paused. "
+                        "If nf<0, run the target with flash-attention (-fa) so V is non-transposed.\n",
+                        layer_full, nf, gap, nf);
+            }
+            return;
+        }
+        commit(gap, kf, vf, ks, vs); // full -> device@[base..], swa -> windowed host; acc_len -> p1
+        LOG_INF("g4a: backfilled %d shared-KV positions [%d,%d) from target cache (swa rows %d/%d); realigned\n",
+                gap, base, p1, ns, gap);
+    }
     ~common_speculative_impl_draft_gemma4_assistant() override {
         if (kv_buf) ggml_backend_buffer_free(kv_buf);
         if (kv_ctx) ggml_free(kv_ctx);
@@ -1036,7 +1064,8 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // rewind. (pos0>acc_len would be a capture gap we can't backfill -> warn; shouldn't happen.)
         if (pos0 == 0)            { reset_state(); }
         else if (pos0 < acc_len)  { LOG_DBG("g4a rewind: pos0=%d < acc_len=%d (prefix reuse); truncating\n", pos0, acc_len); truncate_to(pos0); }
-        else if (pos0 > acc_len)  { if ((dbg_gap & 511) == 0) LOG_WRN("g4a: pos0=%d > acc_len=%d (capture gap from prompt-cache/checkpoint restore); drafting paused until aligned\n", pos0, acc_len); }
+        // pos0 > acc_len (capture gap from prompt-cache/checkpoint/LCP restore) is handled by
+        // backfill_gap() below, once fpp_* is known from this decode's capture.
         verify_n = n;
         // store per-position post-norm hidden (HF hidden_states[-1]) for accept()
         verify_h.resize((size_t) n * n_embd_bb);
@@ -1045,6 +1074,11 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             if (h) memcpy(verify_h.data() + (size_t) i * n_embd_bb, h, (size_t) n_embd_bb * sizeof(float));
         }
         if (fpp_full == 0 && !cap_kf.empty()) { fpp_full = (int)(cap_kf.size() / n); fpp_swa = (int)(cap_ks.size() / n); }
+        // Capture gap (pos0 > acc_len): the server restored shared KV without decoding it. Backfill the
+        // missing positions from the target's KV cache so acc_len realigns and drafting can resume. A
+        // gap is always a restore/prefill boundary, so the current decode is ground truth (commit, not
+        // a stale verify) -> clear expect_accept.
+        if (pos0 > acc_len) { expect_accept = false; backfill_gap(pos0); }
         // Two kinds of decode reach process():
         //  - verify decode  (expect_accept): batch = [id_last, draft_0..]; accept() will commit the
         //    validated prefix. Hand this capture to accept() via vbuf_*.
