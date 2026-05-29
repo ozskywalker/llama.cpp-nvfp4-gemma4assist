@@ -125,10 +125,14 @@ struct llama_gemma4_assistant_io {
     int32_t kv_len_swa  = 0;  // sliding-attention KV length (== min(context, sliding_window))
     int32_t n_tokens    = 0;
     const float * embd   = nullptr; // [2*n_embd_backbone, n_tokens] (F32)
-    const void  * k_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len_full] (F16)
-    const void  * v_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len_full] (F16)
-    const void  * k_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len_swa]  (F16)
-    const void  * v_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len_swa]  (F16)
+    // full-layer KV: prefer the device-resident tensors (dev_*) which the graph views with no
+    // per-decode copy; the host pointers (k_full/v_full) are a fallback (memcpy'd via set_input).
+    struct ggml_tensor * dev_k_full = nullptr; // device F16 [n_embd_head_k, n_head_kv_full, >=kv_len_full]
+    struct ggml_tensor * dev_v_full = nullptr;
+    const void  * k_full = nullptr; // [n_embd_head_k,     n_head_kv_full, kv_len_full] (F16) host fallback
+    const void  * v_full = nullptr;
+    const void  * k_swa  = nullptr; // [n_embd_head_k_swa, n_head_kv_swa,  kv_len_swa]  (F16) host (small)
+    const void  * v_swa  = nullptr;
 };
 
 // attach (or clear, with io == nullptr) draft I/O to a gemma4_assistant model.
@@ -139,3 +143,7 @@ LLAMA_API void llama_gemma4_assistant_set_io(struct llama_model * model, const s
 // settable at context creation). used by the gemma4_assistant speculative driver to capture the
 // target backbone's shared KV (Kcur_pos / Vcur_normed) during decode.
 LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data);
+
+// buffer type of the context's primary compute backend -- for allocating persistent device
+// tensors a graph can view (e.g. the gemma4_assistant draft's resident full-layer KV).
+LLAMA_API ggml_backend_buffer_type_t llama_context_dev_buft(struct llama_context * ctx);

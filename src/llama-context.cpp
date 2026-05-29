@@ -3604,6 +3604,11 @@ void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callba
     ctx->set_eval_callback(cb, user_data);
 }
 
+ggml_backend_buffer_type_t llama_context_dev_buft(llama_context * ctx) {
+    ggml_backend_t backend = ggml_backend_sched_get_backend(ctx->get_sched(), 0);
+    return ggml_backend_get_default_buffer_type(backend);
+}
+
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {
     ctx->synchronize();
 

@@ -842,8 +842,14 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
 
     // shared KV captured from the target via cb_eval (f32; accumulated within a decode)
     std::vector<float> cap_kf, cap_vf, cap_ks, cap_vs; int cap_seq = 0;
-    // accumulated full-sequence backbone shared KV, stored as F16 (fed directly to the draft graph)
-    std::vector<ggml_fp16_t> acc_kf, acc_vf, acc_ks, acc_vs; int acc_len = 0;
+    // full-layer KV: device-resident F16, append-only (the large one; the draft graph views it)
+    ggml_context * kv_ctx = nullptr;
+    ggml_backend_buffer_t kv_buf = nullptr;
+    ggml_tensor * dev_k_full = nullptr, * dev_v_full = nullptr;
+    int dev_hd_full = 0, dev_nkv_full = 0, max_ctx = 0;
+    // sliding-layer KV: host F16, windowed feed each step (small)
+    std::vector<ggml_fp16_t> acc_ks, acc_vs;
+    int acc_len = 0;                  // committed positions (full == swa)
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
     std::vector<float> last_hidden;   // backbone post-norm hidden of the last validated token
@@ -863,32 +869,54 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         return true;
     }
     void on_eval(struct ggml_tensor * t) {
-        auto grab = [&](const std::string & name, std::vector<float> & dst) {
-            if (name == t->name) {
-                const size_t off = dst.size();
-                dst.resize(off + ggml_nelements(t));
-                ggml_backend_tensor_get(t, dst.data() + off, 0, ggml_nbytes(t));
-                cap_seq = (int) t->ne[2]; // per-ubatch; total tracked via acc on append
-            }
+        auto grab = [&](const std::string & name, std::vector<float> & dst) -> bool {
+            if (name != t->name) return false;
+            const size_t off = dst.size();
+            dst.resize(off + ggml_nelements(t));
+            ggml_backend_tensor_get(t, dst.data() + off, 0, ggml_nbytes(t));
+            return true;
         };
-        grab("Kcur_pos-"    + std::to_string(layer_full), cap_kf);
+        if (grab("Kcur_pos-" + std::to_string(layer_full), cap_kf)) { dev_hd_full = (int) t->ne[0]; dev_nkv_full = (int) t->ne[1]; }
         grab("Vcur_normed-" + std::to_string(layer_full), cap_vf);
         grab("Kcur_pos-"    + std::to_string(layer_swa),  cap_ks);
         grab("Vcur_normed-" + std::to_string(layer_swa),  cap_vs);
     }
-    void cap_clear() { cap_kf.clear(); cap_vf.clear(); cap_ks.clear(); cap_vs.clear(); cap_seq = 0; }
+    void cap_clear() { cap_kf.clear(); cap_vf.clear(); cap_ks.clear(); cap_vs.clear(); }
     // append the first `count` f32 elements of src as F16 to dst
     static void append_f16(std::vector<ggml_fp16_t> & dst, const std::vector<float> & src, size_t count) {
         const size_t off = dst.size();
         dst.resize(off + count);
         for (size_t i = 0; i < count; ++i) dst[off + i] = ggml_fp32_to_fp16(src[i]);
     }
-    void acc_append() {
-        append_f16(acc_kf, cap_kf, cap_kf.size());
-        append_f16(acc_vf, cap_vf, cap_vf.size());
-        append_f16(acc_ks, cap_ks, cap_ks.size());
-        append_f16(acc_vs, cap_vs, cap_vs.size());
-        acc_len = fpp_full > 0 ? (int) (acc_kf.size() / fpp_full) : 0; // derive: stays consistent with the data
+    // lazily allocate the persistent device full-KV tensors (on first capture, once dims are known)
+    void ensure_dev() {
+        if (dev_k_full || dev_hd_full == 0 || fpp_full == 0) return;
+        max_ctx = (int) llama_n_ctx(params.ctx_dft);
+        struct ggml_init_params p = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/ true };
+        kv_ctx = ggml_init(p);
+        dev_k_full = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F16, dev_hd_full, dev_nkv_full, max_ctx);
+        dev_v_full = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F16, dev_hd_full, dev_nkv_full, max_ctx);
+        kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, llama_context_dev_buft(params.ctx_dft));
+        LOG_INF("%s: gemma4_assistant device full-KV [%d,%d,%d] x2 = %.1f MiB\n", __func__,
+                dev_hd_full, dev_nkv_full, max_ctx, 2.0 * dev_hd_full * dev_nkv_full * max_ctx * 2 / (1024.0*1024.0));
+    }
+    // write `npos` positions of `src` (f32) starting at `pos0` into device tensor `dev` (F16)
+    void dev_set(ggml_tensor * dev, const std::vector<float> & src, int pos0, int npos) {
+        std::vector<ggml_fp16_t> tmp((size_t) npos * fpp_full);
+        for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = ggml_fp32_to_fp16(src[i]);
+        ggml_backend_tensor_set(dev, tmp.data(), (size_t) pos0 * fpp_full * sizeof(ggml_fp16_t), tmp.size() * sizeof(ggml_fp16_t));
+    }
+    // commit the first `npos` captured positions: full -> device (append), swa -> host (append)
+    void commit(int npos) {
+        if (npos <= 0) return;
+        ensure_dev();
+        if (dev_k_full && acc_len + npos <= max_ctx) {
+            dev_set(dev_k_full, cap_kf, acc_len, npos);
+            dev_set(dev_v_full, cap_vf, acc_len, npos);
+        }
+        append_f16(acc_ks, cap_ks, (size_t) npos * fpp_swa);
+        append_f16(acc_vs, cap_vs, (size_t) npos * fpp_swa);
+        acc_len += npos;
     }
 
     common_speculative_impl_draft_gemma4_assistant(const common_params_speculative & p, uint32_t n_seq)
@@ -928,8 +956,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     }
 
     void reset_state() {
-        acc_kf.clear(); acc_vf.clear(); acc_ks.clear(); acc_vs.clear(); acc_len = 0;
+        // device full-KV buffer is reused (overwritten from position 0); just reset the length
+        acc_ks.clear(); acc_vs.clear(); acc_len = 0;
         last_hidden.clear(); cap_clear();
+    }
+    ~common_speculative_impl_draft_gemma4_assistant() override {
+        if (kv_buf) ggml_backend_buffer_free(kv_buf);
+        if (kv_ctx) ggml_free(kv_ctx);
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -951,7 +984,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // acceptance lever.
         bool seeded = false;
         if (acc_len == 0 && !cap_kf.empty()) {
-            acc_append();
+            commit(verify_n);
             if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
             cap_clear();
             seeded = true;
@@ -976,11 +1009,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             g4a_row_f32(tok_embd, cur_tok, emb);
             memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
             memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
-            // full layers see the whole context; sliding layers see only the last `sliding_window`
+            // full layers see the whole context (device-resident, viewed); sliding layers see only
+            // the last `sliding_window` positions (windowed host feed)
             const int kv_swa = std::min(acc_len, sliding_window);
             const size_t off_swa = (size_t)(acc_len - kv_swa) * fpp_swa; // window offset into acc_swa
             io.kv_len_full = acc_len; io.kv_len_swa = kv_swa; io.n_tokens = 1; io.embd = wide.data();
-            io.k_full = acc_kf.data(); io.v_full = acc_vf.data();
+            io.dev_k_full = dev_k_full; io.dev_v_full = dev_v_full;
             io.k_swa  = acc_ks.data() + off_swa; io.v_swa  = acc_vs.data() + off_swa;
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
@@ -1006,16 +1040,11 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         if (seq_id != 0 || verify_n <= 0 || cap_kf.empty()) { cap_clear(); return; }
         // verify batch = [id_last, draft_0, ..., draft_{K-1}]; n_accepted = accepted draft count.
         // validated this cycle = id_last + n_accepted drafts => commit (n_accepted + 1) positions.
-        const int cap_pos = fpp_full > 0 ? (int)(cap_kf.size() / fpp_full) : verify_n;
-        const int commit  = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
-        if (commit <= 0) { cap_clear(); return; }
-        const size_t bf = (size_t) fpp_full, bs = (size_t) fpp_swa;
-        append_f16(acc_kf, cap_kf, bf * commit);
-        append_f16(acc_vf, cap_vf, bf * commit);
-        append_f16(acc_ks, cap_ks, bs * commit);
-        append_f16(acc_vs, cap_vs, bs * commit);
-        acc_len = fpp_full > 0 ? (int)(acc_kf.size() / fpp_full) : acc_len;
-        last_hidden.assign(verify_h.begin() + (size_t)(commit - 1) * n_embd_bb, verify_h.begin() + (size_t) commit * n_embd_bb);
+        const int cap_pos  = fpp_full > 0 ? (int)(cap_kf.size() / fpp_full) : verify_n;
+        const int n_commit = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
+        if (n_commit <= 0) { cap_clear(); return; }
+        last_hidden.assign(verify_h.begin() + (size_t)(n_commit - 1) * n_embd_bb, verify_h.begin() + (size_t) n_commit * n_embd_bb);
+        commit(n_commit); // full -> device, swa -> host; advances acc_len
         cap_clear();
     }
 
