@@ -872,6 +872,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     int dbg_cycles = 0;               // draft() invocation counter (for periodic mem logging)
     int dbg_cycles_prev = 0;          // dbg_cycles at last timing flush
     int dbg_proc = 0;                 // process() invocation counter (for periodic mem logging)
+    int dbg_gap = 0;                  // capture-gap warning throttle
     int64_t t_draft_us = 0, t_decode_us = 0, t_post_us = 0; int n_draft_steps = 0; // per-interval timing
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
@@ -1035,7 +1036,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         // rewind. (pos0>acc_len would be a capture gap we can't backfill -> warn; shouldn't happen.)
         if (pos0 == 0)            { reset_state(); }
         else if (pos0 < acc_len)  { LOG_DBG("g4a rewind: pos0=%d < acc_len=%d (prefix reuse); truncating\n", pos0, acc_len); truncate_to(pos0); }
-        else if (pos0 > acc_len)  { LOG_WRN("g4a: pos0=%d > acc_len=%d (capture gap); draft KV may be misaligned\n", pos0, acc_len); }
+        else if (pos0 > acc_len)  { if ((dbg_gap & 511) == 0) LOG_WRN("g4a: pos0=%d > acc_len=%d (capture gap from prompt-cache/checkpoint restore); drafting paused until aligned\n", pos0, acc_len); }
         verify_n = n;
         // store per-position post-norm hidden (HF hidden_states[-1]) for accept()
         verify_h.resize((size_t) n * n_embd_bb);
@@ -1080,6 +1081,19 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         LOG_DBG("g4a draft: drafting=%d id_last=%d n_past=%d acc_len=%d have_hidden=%d\n",
                 (int) dp.drafting, dp.id_last, dp.n_past, acc_len, (int) !last_hidden.empty());
         if (!dp.drafting || acc_len == 0 || last_hidden.empty()) return;
+        // Capture gap: the server restored shared KV from its prompt-cache / context-checkpoint
+        // without re-decoding it, so cb_eval never saw those positions and acc_len lags the target
+        // (dp.n_past). Drafting over the misaligned/short KV yields ~0% acceptance and wastes draft()
+        // time -- skip until alignment is restored (graceful fall back to target-only, still lossless).
+        // (Run with --cache-ram 0 --ctx-checkpoints 0 to avoid the gap, or see the KV-cache-read TODO.)
+        if (dp.n_past > acc_len + 4) {
+            if ((dbg_gap++ & 511) == 0) {
+                LOG_WRN("g4a: draft skipped -- KV capture gap (acc_len=%d behind target n_past=%d); "
+                        "prompt-cache/checkpoint restore was not captured. Use --cache-ram 0 --ctx-checkpoints 0.\n",
+                        acc_len, dp.n_past);
+            }
+            return;
+        }
 
         const llama_model * md = llama_get_model(params.ctx_dft);
         llama_token cur_tok = dp.id_last;
