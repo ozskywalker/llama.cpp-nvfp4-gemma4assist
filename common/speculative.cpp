@@ -939,6 +939,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         }
         append_f16(acc_ks, src_ks, (size_t) npos * fpp_swa);
         append_f16(acc_vs, src_vs, (size_t) npos * fpp_swa);
+        // the draft's sliding-attention layers only ever read the last `sliding_window` positions, so
+        // drop older ones -- keeps host SWA accumulation at ~sliding_window (not full context: ~2 GiB
+        // -> ~8 MiB at 128K). The full-layer KV stays complete on the device tensor (indexed by acc_len).
+        const size_t max_sw = (size_t) sliding_window * fpp_swa;
+        if (acc_ks.size() > max_sw) acc_ks.erase(acc_ks.begin(), acc_ks.end() - max_sw);
+        if (acc_vs.size() > max_sw) acc_vs.erase(acc_vs.begin(), acc_vs.end() - max_sw);
         acc_len += npos;
     }
 
@@ -1050,12 +1056,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
             memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
             // full layers see the whole context (device-resident, viewed); sliding layers see only
-            // the last `sliding_window` positions (windowed host feed)
+            // the last `sliding_window` positions, which is exactly what acc_ks/vs now hold (windowed
+            // in commit()), so feed the whole buffer from offset 0.
             const int kv_swa = std::min(acc_len, sliding_window);
-            const size_t off_swa = (size_t)(acc_len - kv_swa) * fpp_swa; // window offset into acc_swa
             io.kv_len_full = acc_len; io.kv_len_swa = kv_swa; io.n_tokens = 1; io.embd = wide.data();
             io.dev_k_full = dev_k_full; io.dev_v_full = dev_v_full;
-            io.k_swa  = acc_ks.data() + off_swa; io.v_swa  = acc_vs.data() + off_swa;
+            io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
             llama_memory_clear(llama_get_memory(params.ctx_dft), true);
