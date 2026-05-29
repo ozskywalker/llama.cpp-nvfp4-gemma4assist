@@ -873,6 +873,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     int dbg_cycles_prev = 0;          // dbg_cycles at last timing flush
     int dbg_proc = 0;                 // process() invocation counter (for periodic mem logging)
     int dbg_gap = 0;                  // capture-gap warning throttle
+    // priming (id_last/last_hidden off-by-one fix): seed the chain from the last validated token so the
+    // first draft sees a matched (token@p, hidden@p) pair. G4A_PRIME=0 disables (legacy off-by-one).
+    bool use_prime = true;
+    llama_token last_tok = -1;        // token id at position acc_len-1 (last validated token)
+    std::vector<llama_token> verify_tok; // verify-batch token ids; accept() derives last_tok from these
+    int acc_hist[8] = {0};            // histogram of n_accepted per verify cycle (per-k acceptance)
+    int acc_cycles = 0;
     int64_t t_draft_us = 0, t_decode_us = 0, t_post_us = 0; int n_draft_steps = 0; // per-interval timing
     // per-position post-norm hidden from the last process() (for accept())
     std::vector<float> verify_h; int verify_n = 0;
@@ -990,6 +997,8 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
 
         const char * host_env = getenv("G4A_HOST_KV");
         use_host_kv = host_env && atoi(host_env) != 0; // default: device-view path (faster, validated equal acceptance); G4A_HOST_KV=1 for the host fallback
+        const char * prime_env = getenv("G4A_PRIME");
+        use_prime = !prime_env || atoi(prime_env) != 0; // default: priming on (off-by-one fix); G4A_PRIME=0 for legacy
 
         LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d full-KV path=%s\n",
                 __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa, use_host_kv ? "host" : "device");
@@ -1006,6 +1015,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         last_hidden.clear(); cap_clear();
         vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear();
         expect_accept = false;
+        last_tok = -1; verify_tok.clear();
     }
 
     // Rewind committed KV to position `p` (< acc_len). Happens when the server reuses a cached prefix
@@ -1089,9 +1099,13 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         bool seeded = false;
         if (expect_accept) {
             vbuf_kf.swap(cap_kf); vbuf_vf.swap(cap_vf); vbuf_ks.swap(cap_ks); vbuf_vs.swap(cap_vs);
+            verify_tok.assign(batch_in.token, batch_in.token + n); // accept() picks last_tok = verify_tok[n_commit-1]
         } else if (!cap_kf.empty()) {
             commit(verify_n, cap_kf, cap_vf, cap_ks, cap_vs);
-            if (n > 0) last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
+            if (n > 0) {
+                last_hidden.assign(verify_h.begin() + (size_t)(n - 1) * n_embd_bb, verify_h.begin() + (size_t) n * n_embd_bb);
+                last_tok = batch_in.token[n - 1]; // last validated token (for the priming draft step)
+            }
             seeded = true;
         }
         const double mb = 1.0 / (1024.0 * 1024.0);
@@ -1130,50 +1144,60 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         }
 
         const llama_model * md = llama_get_model(params.ctx_dft);
-        llama_token cur_tok = dp.id_last;
-        std::vector<float> cur_h = last_hidden;
         std::vector<float> emb, wide(2 * n_embd_bb);
-        const int64_t t_call0 = ggml_time_us();
-        // honor both the static --draft-max (params.n_max) and the per-call cap (dp.n_max), like the
-        // other draft impls -- so K can be tuned with --draft-max (e.g. 2: k>=2 rarely accepts).
-        const int n_max = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
-        for (int k = 0; k < n_max; ++k) {
-            g4a_row_f32(tok_embd, cur_tok, emb);
-            memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
-            memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
-            // full layers see the whole context (device-resident, viewed); sliding layers see only
-            // the last `sliding_window` positions, which is exactly what acc_ks/vs now hold (windowed
-            // in commit()), so feed the whole buffer from offset 0.
-            // kv_len_swa = positions actually held in acc_ks (== min(acc_len, sliding_window) in steady
-            // state, but smaller right after a truncate_to() rewind until the window refills -- using the
-            // buffer count keeps the graph view in-bounds).
-            const int kv_swa = fpp_swa > 0 ? (int)(acc_ks.size() / fpp_swa) : 0;
+        // sliding window = positions actually held in acc_ks (in-bounds even mid-refill after a rewind)
+        const int kv_swa = fpp_swa > 0 ? (int)(acc_ks.size() / fpp_swa) : 0;
+
+        // one draft decode at the fixed RoPE position acc_len-1 (single-position multi-token, matching
+        // the HF candidate generator and spec_run): feed (token, hidden) over the backbone KV; return
+        // the argmax token and (via h_out) the post-projected backbone hidden for the next step.
+        auto step = [&](llama_token tok, const std::vector<float> & h_in, std::vector<float> & h_out) -> llama_token {
+            g4a_row_f32(tok_embd, tok, emb);
+            memcpy(wide.data(),             emb.data(),  (size_t) n_embd_bb * sizeof(float));
+            memcpy(wide.data() + n_embd_bb, h_in.data(), (size_t) n_embd_bb * sizeof(float));
             io.kv_len_full = acc_len; io.kv_len_swa = kv_swa; io.n_tokens = 1; io.embd = wide.data();
             if (use_host_kv) { io.dev_k_full = nullptr;    io.dev_v_full = nullptr;    io.k_full = acc_kf.data(); io.v_full = acc_vf.data(); }
             else             { io.dev_k_full = dev_k_full; io.dev_v_full = dev_v_full; io.k_full = nullptr;       io.v_full = nullptr; }
-            io.k_swa  = acc_ks.data(); io.v_swa  = acc_vs.data();
+            io.k_swa = acc_ks.data(); io.v_swa = acc_vs.data();
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
             const int64_t td0 = ggml_time_us();
-            // reset only the KV-cache metadata (data=false): the draft writes no KV and never reads
-            // its own cache (pure cross-attention over io), so zeroing the buffers each step is wasted
-            // work -- we just need a free slot for the fixed RoPE position acc_len-1.
+            // reset only KV-cache metadata (data=false): the draft writes no KV and cross-attends over io.
             llama_memory_clear(llama_get_memory(params.ctx_dft), false);
             llama_batch b = llama_batch_init(1, 0, 1);
             b.n_tokens = 1; b.token[0] = 0; b.pos[0] = acc_len - 1; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
-            if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); break; }
+            if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); return -1; }
             const float * dl = llama_get_logits_ith(params.ctx_dft, 0);
             const int64_t td1 = ggml_time_us();
-            llama_token dtok = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dtok]) dtok = v;
-            // embeddings output is now the backbone-space hidden (n_embd_bb), with mtp.post_projection
-            // applied on-device -- feed it straight back (no host matmul).
-            const float * ph = llama_get_embeddings_ith(params.ctx_dft, 0);
+            llama_token dt = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dt]) dt = v;
+            const float * ph = llama_get_embeddings_ith(params.ctx_dft, 0); // backbone hidden (post_proj on-device)
+            h_out.assign(ph, ph + n_embd_bb);
             const int64_t td2 = ggml_time_us();
             t_decode_us += td1 - td0; t_post_us += td2 - td1; n_draft_steps++;
-            cur_h.assign(ph, ph + n_embd_bb); cur_tok = dtok;
-            dp.result->push_back(dtok);
-            expect_accept = true; // drafted at least one token => the next decode is a verify decode
             llama_batch_free(b);
+            return dt;
+        };
+
+        const int64_t t_call0 = ggml_time_us();
+        llama_token cur_tok = dp.id_last;
+        std::vector<float> cur_h = last_hidden, h_next;
+        // Priming (fixes the id_last/last_hidden off-by-one): the assistant pairs embed(token@p) with
+        // hidden@p (same position). last_hidden is hidden@(acc_len-1) but id_last is token@acc_len, so
+        // feeding them directly is mismatched. Instead run one step from the *matched* last validated
+        // (last_tok=token@(acc_len-1), last_hidden) to bootstrap an estimate of hidden@acc_len, then
+        // draft from the real bonus id_last with that estimate. Costs one extra draft decode.
+        if (use_prime && last_tok >= 0) {
+            std::vector<float> est_h;
+            if (step(last_tok, last_hidden, est_h) >= 0) { cur_tok = dp.id_last; cur_h = std::move(est_h); }
+        }
+        // honor both the static (params.n_max) and per-call (dp.n_max) draft caps -> tune K via --spec-draft-n-max.
+        const int n_max = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+        for (int k = 0; k < n_max; ++k) {
+            const llama_token dt = step(cur_tok, cur_h, h_next);
+            if (dt < 0) break;
+            cur_tok = dt; cur_h = h_next;
+            dp.result->push_back(dt);
+            expect_accept = true; // drafted at least one token => the next decode is a verify decode
         }
         t_draft_us += ggml_time_us() - t_call0;
         if ((++dbg_cycles & 63) == 0) {
@@ -1185,8 +1209,15 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
                     acc_kf.size()*sizeof(ggml_fp16_t)*mb, acc_vf.size()*sizeof(ggml_fp16_t)*mb,
                     acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb,
                     (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb);
-            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms sample+read=%.2f ms (n_step=%d)\n",
-                    dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps);
+            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms sample+read=%.2f ms (n_step=%d) prime=%d\n",
+                    dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps, (int) use_prime);
+            if (acc_cycles > 0) {
+                // per-k in-chain acceptance = P(n_accepted >= k+1); avg accepted drafts/cycle
+                long ge1 = 0, ge2 = 0, tot = 0; double sum = 0;
+                for (int i = 0; i < 8; ++i) { tot += acc_hist[i]; sum += (double) i * acc_hist[i]; if (i >= 1) ge1 += acc_hist[i]; if (i >= 2) ge2 += acc_hist[i]; }
+                LOG_INF("g4a accept[cycles=%d]: k0=%.1f%% k1=%.1f%% avg_acc=%.2f drafts/cycle\n",
+                        acc_cycles, tot ? 100.0*ge1/tot : 0.0, tot ? 100.0*ge2/tot : 0.0, tot ? sum/tot : 0.0);
+            }
             t_draft_us = t_decode_us = t_post_us = 0; n_draft_steps = 0; dbg_cycles_prev = dbg_cycles;
         }
     }
@@ -1203,8 +1234,10 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         const int n_commit = std::min<int>(n_accepted + 1, std::min(cap_pos, verify_n));
         if (n_commit > 0) {
             last_hidden.assign(verify_h.begin() + (size_t)(n_commit - 1) * n_embd_bb, verify_h.begin() + (size_t) n_commit * n_embd_bb);
+            if (n_commit - 1 < (int) verify_tok.size()) last_tok = verify_tok[n_commit - 1]; // last validated token (priming seed)
             commit(n_commit, vbuf_kf, vbuf_vf, vbuf_ks, vbuf_vs); // full -> device, swa -> host; advances acc_len
         }
+        acc_hist[std::min<int>(n_accepted, 7)]++; acc_cycles++; // per-k acceptance histogram
         vbuf_kf.clear(); vbuf_vf.clear(); vbuf_ks.clear(); vbuf_vs.clear();
     }
 
