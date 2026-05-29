@@ -1209,8 +1209,9 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
                     acc_kf.size()*sizeof(ggml_fp16_t)*mb, acc_vf.size()*sizeof(ggml_fp16_t)*mb,
                     acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb,
                     (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb);
-            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms sample+read=%.2f ms (n_step=%d) prime=%d\n",
-                    dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps, (int) use_prime);
+            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms sample+read=%.2f ms (n_step=%d) prime=%d dft_graphs_reused=%d\n",
+                    dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps, (int) use_prime,
+                    llama_perf_context(params.ctx_dft).n_reused);
             if (acc_cycles > 0) {
                 // per-k in-chain acceptance = P(n_accepted >= k+1); avg accepted drafts/cycle
                 long ge1 = 0, ge2 = 0, tot = 0; double sum = 0;
