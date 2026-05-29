@@ -148,16 +148,27 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
         else                    { if (idx_full < 0) idx_full = il; }
     }
 
-    // inputs provided by the speculative driver (see llama_gemma4_assistant_set_io); KV is F16
+    // inputs provided by the speculative driver (see llama_gemma4_assistant_set_io); KV is F16.
     auto inp = std::make_unique<llm_graph_input_gemma4_assistant>(io);
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*n_embd_bb, n_tokens);
     ggml_set_input(inp->embd);
-    if (idx_full >= 0) {
+
+    // full-layer KV: prefer a view into the driver's persistent device tensor (no per-decode copy);
+    // otherwise a host input tensor that set_input() memcpy's each decode.
+    ggml_tensor * K_full = nullptr, * V_full = nullptr;
+    if (io && io->dev_k_full && idx_full >= 0) {
+        K_full = ggml_view_3d(ctx0, io->dev_k_full, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full,
+                              io->dev_k_full->nb[1], io->dev_k_full->nb[2], 0);
+        V_full = ggml_view_3d(ctx0, io->dev_v_full, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full,
+                              io->dev_v_full->nb[1], io->dev_v_full->nb[2], 0);
+    } else if (idx_full >= 0) {
         inp->k_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full);
         inp->v_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_full, hparams.n_head_kv(idx_full), kv_len_full);
         ggml_set_input(inp->k_full);
         ggml_set_input(inp->v_full);
+        K_full = inp->k_full; V_full = inp->v_full;
     }
+    // sliding-layer KV stays a host input (only the last `sliding_window` positions -> small)
     if (idx_swa >= 0) {
         inp->k_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len_swa);
         inp->v_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len_swa);
@@ -180,8 +191,8 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
         const float   fb    = m.get_rope_freq_base (cparams, il);
         const float   fs    = m.get_rope_freq_scale(cparams, il);
         ggml_tensor * ff    = swa ? nullptr     : m.layers[il].rope_freqs; // proportional rope (full layers)
-        ggml_tensor * K     = swa ? INP->k_swa  : INP->k_full;
-        ggml_tensor * V     = swa ? INP->v_swa  : INP->v_full;
+        ggml_tensor * K     = swa ? INP->k_swa  : K_full;
+        ggml_tensor * V     = swa ? INP->v_swa  : V_full;
 
         ggml_tensor * res_x = x;
 
