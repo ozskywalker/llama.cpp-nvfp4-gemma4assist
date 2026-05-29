@@ -849,7 +849,6 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
     int layer_full = -1, layer_swa = -1; // backbone shared-KV layers
 
     g4a_raw tok_embd;                 // backbone token_embd (raw, for embedding draft tokens)
-    std::vector<float> post_f32;      // draft mtp.post_projection [n_embd_bb * n_embd_dft]
 
     // shared KV captured from the target via cb_eval (f32; accumulated within a decode)
     std::vector<float> cap_kf, cap_vf, cap_ks, cap_vs; int cap_seq = 0;
@@ -982,9 +981,8 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         layer_swa = (layer_full == n_layer - 1) ? n_layer - 2 : n_layer - 1;
 
         tok_embd = g4a_load_raw(params.model_path_tgt, "token_embd.weight");
-        g4a_raw post = g4a_load_raw(params.mparams.path, "mtp.post_projection.weight"); // ne=[n_embd_dft, n_embd_bb]
-        post_f32.resize((size_t) post.ne[1] * post.ne[0]);
-        { std::vector<float> rb; for (int64_t o = 0; o < post.ne[1]; ++o) { g4a_row_f32(post, o, rb); memcpy(post_f32.data() + (size_t) o * n_embd_dft, rb.data(), (size_t) n_embd_dft * sizeof(float)); } }
+        // mtp.post_projection is applied on-device in the draft graph (the embeddings output is the
+        // backbone-space hidden), so no host copy of that weight is needed.
 
         llama_set_eval_callback(params.ctx_tgt, cb_eval, this); // install backbone KV capture
         llama_set_embeddings(params.ctx_dft, true); // draft outputs the post-norm hidden (for host post_projection)
@@ -1086,9 +1084,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         const llama_model * md = llama_get_model(params.ctx_dft);
         llama_token cur_tok = dp.id_last;
         std::vector<float> cur_h = last_hidden;
-        std::vector<float> emb, wide(2 * n_embd_bb), nrm;
+        std::vector<float> emb, wide(2 * n_embd_bb);
         const int64_t t_call0 = ggml_time_us();
-        for (int k = 0; k < params.n_max; ++k) {
+        // honor both the static --draft-max (params.n_max) and the per-call cap (dp.n_max), like the
+        // other draft impls -- so K can be tuned with --draft-max (e.g. 2: k>=2 rarely accepts).
+        const int n_max = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+        for (int k = 0; k < n_max; ++k) {
             g4a_row_f32(tok_embd, cur_tok, emb);
             memcpy(wide.data(),             emb.data(),   (size_t) n_embd_bb * sizeof(float));
             memcpy(wide.data() + n_embd_bb, cur_h.data(), (size_t) n_embd_bb * sizeof(float));
@@ -1106,20 +1107,22 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             llama_gemma4_assistant_set_io(const_cast<llama_model *>(md), &io);
 
             const int64_t td0 = ggml_time_us();
-            llama_memory_clear(llama_get_memory(params.ctx_dft), true);
+            // reset only the KV-cache metadata (data=false): the draft writes no KV and never reads
+            // its own cache (pure cross-attention over io), so zeroing the buffers each step is wasted
+            // work -- we just need a free slot for the fixed RoPE position acc_len-1.
+            llama_memory_clear(llama_get_memory(params.ctx_dft), false);
             llama_batch b = llama_batch_init(1, 0, 1);
             b.n_tokens = 1; b.token[0] = 0; b.pos[0] = acc_len - 1; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
             if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); break; }
             const float * dl = llama_get_logits_ith(params.ctx_dft, 0);
             const int64_t td1 = ggml_time_us();
             llama_token dtok = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dtok]) dtok = v;
-            const float * dn = llama_get_embeddings_ith(params.ctx_dft, 0); // post-norm hidden [n_embd_dft]
-            // host post_projection: out[o] = sum_i dn[i] * post_f32[o*n_embd_dft + i]
-            nrm.assign(n_embd_bb, 0.0f);
-            for (int o = 0; o < n_embd_bb; ++o) { const float * w = post_f32.data() + (size_t) o * n_embd_dft; float s = 0; for (int i = 0; i < n_embd_dft; ++i) s += dn[i] * w[i]; nrm[o] = s; }
+            // embeddings output is now the backbone-space hidden (n_embd_bb), with mtp.post_projection
+            // applied on-device -- feed it straight back (no host matmul).
+            const float * ph = llama_get_embeddings_ith(params.ctx_dft, 0);
             const int64_t td2 = ggml_time_us();
             t_decode_us += td1 - td0; t_post_us += td2 - td1; n_draft_steps++;
-            cur_h = nrm; cur_tok = dtok;
+            cur_h.assign(ph, ph + n_embd_bb); cur_tok = dtok;
             dp.result->push_back(dtok);
             expect_accept = true; // drafted at least one token => the next decode is a verify decode
             llama_batch_free(b);
@@ -1134,7 +1137,7 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
                     acc_kf.size()*sizeof(ggml_fp16_t)*mb, acc_vf.size()*sizeof(ggml_fp16_t)*mb,
                     acc_ks.size()*sizeof(ggml_fp16_t)*mb, acc_vs.size()*sizeof(ggml_fp16_t)*mb,
                     (vbuf_kf.size()+vbuf_vf.size()+vbuf_ks.size()+vbuf_vs.size())*4*mb);
-            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms post_proj=%.2f ms (n_step=%d)\n",
+            LOG_INF("g4a time[cyc=%d acc_len=%d]: draft()=%.2f ms/call | per step: decode=%.2f ms sample+read=%.2f ms (n_step=%d)\n",
                     dbg_cycles, acc_len, t_draft_us * ic, t_decode_us * is, t_post_us * is, n_draft_steps);
             t_draft_us = t_decode_us = t_post_us = 0; n_draft_steps = 0; dbg_cycles_prev = dbg_cycles;
         }
