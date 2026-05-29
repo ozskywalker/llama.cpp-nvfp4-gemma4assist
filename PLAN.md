@@ -285,24 +285,32 @@ to ~MiB; full-layer KV input ~1 GiB f16). sliding_window hardcoded 1024 (TODO: r
 Verified: 128K loads + runs + fits at ~25 GiB / 32 GiB. The remaining work is about making long
 context fast (and 256K fit), then acceptance + productionization.
 
-1. **On-device resident KV (critical path for 128K/256K perf).** Today the driver memcpy's the
-   full-layer KV host->device on EVERY draft step (~0.5-1 GiB at 128K, ~1-2 GiB at 256K, PCIe-
-   bound). Change to a persistent device buffer the draft graph *views* into, appended with only
-   the new validated positions each cycle (SWA buffer = 1024-slot ring). io passes device tensor
-   handles instead of host pointers; build_arch_graph views them (no set_input memcpy of the KV).
+1. **On-device resident KV (critical path for 128K/256K perf). ✅ DONE (89fefbcea); needs GPU
+   validation.** The driver was memcpy'ing the full-layer KV host->device on EVERY draft step
+   (~0.5-1 GiB at 128K, PCIe-bound). Now a persistent device buffer (`dev_k_full`/`dev_v_full`,
+   `[hd,nkv,n_ctx]` f16, lazily allocated on the draft device via `llama_context_dev_buft`) holds
+   the full-layer KV; the draft graph *views* it (`ggml_view_3d` over the first kv_len_full
+   positions — no per-decode copy). `commit(npos)` appends only the new validated positions
+   (f32->f16) each cycle; SWA KV stays a small windowed host feed (kv_len_swa <= 1024). io carries
+   the device tensor handles (`dev_k_full`/`dev_v_full`); the host `k_full`/`v_full` remain a
+   fallback (spec_run still uses them, verified non-regressed/lossless). REMAINING: validate on
+   GPU/server at 128K — confirm load (look for the device-KV alloc), lossless output, and that
+   long-context tok/s improves vs the host-copy version; watch the view-of-external-tensor + sched
+   interaction (the one untested path).
 2. **256K bring-up.** Target KV ~doubles (~9 GiB q8/q5) -> target+KV ~26 GiB, so 256K likely needs
    `--cache-type q4_0` (~6 GiB). Confirm load at `--ctx-size 262144` and tune KV-quant/quality.
-3. **Capture-gap fix (long-context correctness).** First prompt ubatch (pos0==0) captures no KV on
-   reused/reserved graphs; long prompts could compound the gap in the full-layer KV. Ensure the
-   eval callback fires on every ubatch incl. the graph-reuse path.
+   Note dev_k_full now also scales with n_ctx (~1 GiB f16 at 256K) — budget it.
+3. **Capture-gap fix (long-context correctness). ✅ DONE (f2af48229).** The decode graph-reuse path
+   now re-applies `cparams.cb_eval` via `ggml_backend_sched_set_eval_callback`, so the eval
+   callback fires on every ubatch (incl. reused/reserved graphs) and the full-layer KV no longer
+   has a gap at pos0/long prompts.
 4. **Acceptance: id_last/last_hidden off-by-one** (biggest acceptance lever; see below).
 5. **Multi-sequence / continuous batching** (currently single-seq; per-seq state keyed by seq_id).
 6. **Cleanups**: read sliding_window from hparams (not hardcoded 1024); extend the HF oracle to a
    >1024-token case to numerically validate SWA windowing before trusting 256K.
 
 Remaining acceptance levers (all near the NVFP4 ceiling; refinement, not blockers):
-- first prompt ubatch (pos0==0) captures no KV on reused/reserved graphs (acc trails n_past by a
-  couple positions) — needs the eval callback active on the graph-reuse path. [step 3]
+- ~~first prompt ubatch (pos0==0) captures no KV on reused/reserved graphs~~ ✅ FIXED [step 3].
 - id_last/last_hidden off-by-one: the server samples the bonus then drafts immediately, so the
   draft pairs embed(id_last) with the previous token's hidden (EAGLE/MTP-style) vs the assistant's
   same-position training. Fully matching it needs forwarding id_last through the target first. [step 4]
