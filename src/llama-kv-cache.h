@@ -208,6 +208,15 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // Read the stored K/V for model layer `il`, sequence `seq_id`, positions [p0, p1) into host f32
+    // (dequantized; one [n_embd_k_gqa] / [n_embd_v_gqa] vector per position, ascending). Positions with
+    // no cell are left as-is (caller zero-inits). Returns #positions found, or -1 if unsupported
+    // (layer not in this cache, or transposed V -- requires flash-attention so v_trans is false).
+    // Used by the gemma4_assistant speculative driver to backfill shared KV the server restored from
+    // prompt-cache / checkpoint / LCP-reuse without re-decoding (so cb_eval never captured it).
+    int32_t read_layer_f32(int32_t il, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+                           float * k_out, float * v_out) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

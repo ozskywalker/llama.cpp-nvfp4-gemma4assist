@@ -2065,6 +2065,81 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+int32_t llama_kv_cache::read_layer_f32(int32_t il, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+                                       float * k_out, float * v_out) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return -1; // this (sub-)cache does not hold layer il
+    }
+    if (v_trans) {
+        return -1; // transposed V (no flash-attention); backfill requires v_trans == false
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & cells = v_cells[strm];
+    const auto & layer = layers[it->second];
+    ggml_tensor * k = layer.k_stream[strm];
+    ggml_tensor * v = layer.v_stream[strm];
+    if (!k || !v) {
+        return -1;
+    }
+
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+    const int64_t  npos = (int64_t) p1 - (int64_t) p0;
+    if (npos <= 0) {
+        return 0;
+    }
+
+    const auto * k_tt = ggml_get_type_traits(k->type);
+    const auto * v_tt = ggml_get_type_traits(v->type);
+    if (!k_tt->to_float || !v_tt->to_float) {
+        return -1; // cache dtype has no dequantizer
+    }
+
+    // map each requested position -> physical cell (positions may be non-contiguous, e.g. SWA ring)
+    std::vector<int32_t> pos_cell((size_t) npos, -1);
+    int32_t found = 0;
+    for (uint32_t c = 0; c < cells.size(); ++c) {
+        if (cells.is_empty(c) || !cells.seq_has(c, seq_id)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(c);
+        if (p >= p0 && p < p1 && pos_cell[p - p0] < 0) {
+            pos_cell[p - p0] = (int32_t) c;
+            found++;
+        }
+    }
+
+    const size_t k_row = ggml_row_size(k->type, n_embd_k_gqa);
+    const size_t v_row = ggml_row_size(v->type, n_embd_v_gqa);
+    std::vector<uint8_t> kbuf, vbuf;
+
+    // copy in maximal contiguous cell runs (one backend get per run) -> cheap for restored prefixes
+    int64_t i = 0;
+    while (i < npos) {
+        if (pos_cell[i] < 0) { ++i; continue; }
+        const int32_t c0 = pos_cell[i];
+        int64_t len = 1;
+        while (i + len < npos && pos_cell[i + len] == c0 + (int32_t) len) {
+            ++len;
+        }
+        kbuf.resize((size_t) len * k_row);
+        vbuf.resize((size_t) len * v_row);
+        ggml_backend_tensor_get(k, kbuf.data(), (size_t) c0 * k_row, (size_t) len * k_row);
+        ggml_backend_tensor_get(v, vbuf.data(), (size_t) c0 * v_row, (size_t) len * v_row);
+        for (int64_t t = 0; t < len; ++t) {
+            k_tt->to_float(kbuf.data() + (size_t) t * k_row, k_out + (size_t)(i + t) * n_embd_k_gqa, n_embd_k_gqa);
+            v_tt->to_float(vbuf.data() + (size_t) t * v_row, v_out + (size_t)(i + t) * n_embd_v_gqa, n_embd_v_gqa);
+        }
+        i += len;
+    }
+
+    return found;
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];

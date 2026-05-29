@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -727,6 +729,24 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+int32_t llama_context::kv_read_layer_f32(int32_t il, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+                                         float * k_out, float * v_out) {
+    synchronize(); // make sure pending KV writes are visible
+    llama_memory_i * mem = memory.get();
+    if (!mem) {
+        return -1;
+    }
+    // iSWA: route to the full-attention (base) or sliding (swa) sub-cache by the layer's SWA-ness
+    if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        llama_kv_cache * kc = model.hparams.is_swa(il) ? iswa->get_swa() : iswa->get_base();
+        return kc ? kc->read_layer_f32(il, seq_id, p0, p1, k_out, v_out) : -1;
+    }
+    if (auto * kc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kc->read_layer_f32(il, seq_id, p0, p1, k_out, v_out);
+    }
+    return -1;
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -3607,6 +3627,11 @@ void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callba
 ggml_backend_buffer_type_t llama_context_dev_buft(llama_context * ctx) {
     ggml_backend_t backend = ggml_backend_sched_get_backend(ctx->get_sched(), 0);
     return ggml_backend_get_default_buffer_type(backend);
+}
+
+int32_t llama_kv_read_layer_f32(llama_context * ctx, int32_t il, llama_seq_id seq_id,
+                                llama_pos p0, llama_pos p1, float * k_out, float * v_out) {
+    return ctx->kv_read_layer_f32(il, seq_id, p0, p1, k_out, v_out);
 }
 
 float * llama_get_embeddings_pre_norm(llama_context * ctx) {

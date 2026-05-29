@@ -75,6 +75,13 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    // Read stored K/V for model layer `il`, seq `seq_id`, positions [p0,p1) into host f32 (dequantized,
+    // one vector per position ascending). Routes iSWA (full vs sliding) by hparams.is_swa(il). Returns
+    // #positions found, or -1 if unsupported. Used by the gemma4_assistant speculative driver to
+    // backfill shared KV the server restored without re-decoding (prompt-cache/checkpoint/LCP reuse).
+    int32_t kv_read_layer_f32(int32_t il, llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+                              float * k_out, float * v_out);
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
