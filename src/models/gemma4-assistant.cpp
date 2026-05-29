@@ -136,13 +136,18 @@ void llm_graph_input_gemma4_assistant::set_input(const llama_ubatch * ubatch) {
     cp(k_swa,  io->k_swa);
     cp(v_swa,  io->v_swa);
     // full-layer mask: 0 for the real positions [0, kv_len_full), -inf for the bucket padding.
+    // Every query row (ne[1]) sees the same KV mask.
     if (kq_mask_full) {
         GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_full->buffer));
         float * mdst = (float *) kq_mask_full->data;
-        const int64_t n = kq_mask_full->ne[0];
-        const int64_t real = std::min<int64_t>(io->kv_len_full, n);
-        for (int64_t j = 0; j < real; ++j) mdst[j] = 0.0f;
-        for (int64_t j = real; j < n;    ++j) mdst[j] = -INFINITY;
+        const int64_t nkv  = kq_mask_full->ne[0];
+        const int64_t nq   = kq_mask_full->ne[1];
+        const int64_t real = std::min<int64_t>(io->kv_len_full, nkv);
+        for (int64_t c = 0; c < nq; ++c) {
+            float * row = mdst + c * nkv;
+            for (int64_t j = 0;    j < real; ++j) row[j] = 0.0f;
+            for (int64_t j = real; j < nkv;  ++j) row[j] = -INFINITY;
+        }
     }
 }
 
@@ -218,7 +223,8 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
     }
     // full-layer softmax mask: 0 for the real positions, -inf for the bucket padding (set_input fills it
     // from io->kv_len_full). Only the full layer is bucketed; sliding layers feed exact kv_len_swa.
-    inp->kq_mask_full = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_len_full, 1);
+    // ne[1] must be >= the query count (kq->ne[1] == n_tokens; n_tokens>1 during graph_reserve).
+    inp->kq_mask_full = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_len_full, n_tokens);
     ggml_set_input(inp->kq_mask_full);
     inp->built_kv_full = (int) kv_len_full;
     inp->built_kv_swa  = (int) kv_len_swa;
