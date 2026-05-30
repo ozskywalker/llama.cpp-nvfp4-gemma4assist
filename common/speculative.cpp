@@ -998,7 +998,10 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
         const char * host_env = getenv("G4A_HOST_KV");
         use_host_kv = host_env && atoi(host_env) != 0; // default: device-view path (faster, validated equal acceptance); G4A_HOST_KV=1 for the host fallback
         const char * prime_env = getenv("G4A_PRIME");
-        use_prime = !prime_env || atoi(prime_env) != 0; // default: priming on (off-by-one fix); G4A_PRIME=0 for legacy
+        // Default OFF: empirically priming does not raise k0 (~17.5% with and without) -- the assistant
+        // tolerates the id_last/last_hidden mismatch -- so the +1 draft decode is pure cost (~35% tg
+        // hit at K=2). G4A_PRIME=1 opts in if a longer/different mix ever shows a k0 gain.
+        use_prime = prime_env && atoi(prime_env) != 0;
 
         LOG_INF("%s: gemma4_assistant draft: n_embd_bb=%d n_embd_dft=%d vocab=%d shared KV layers full=%d swa=%d full-KV path=%s\n",
                 __func__, n_embd_bb, n_embd_dft, n_vocab, layer_full, layer_swa, use_host_kv ? "host" : "device");
