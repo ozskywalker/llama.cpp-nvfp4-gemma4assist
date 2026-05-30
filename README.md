@@ -1,359 +1,344 @@
-# FINDINGS
+# llama.cpp-nvfp4-gemma4assist
 
-A self-contained writeup of two pieces of work added to this fork of llama.cpp:
+**Two additions to llama.cpp: faithful NVFP4 quantize output, and a from-scratch integration of Google's official Gemma 4 31B Assistant speculative draft head. Together they let Gemma 4 31B fit and run faster on a single 32 GiB consumer Blackwell GPU at 128K context — losslessly.**
 
-1. **NVFP4 quantization** — an `llama-quantize` output emitter for NVIDIA's two-level FP4 format, so target models can be losslessly serialized to NVFP4 GGUF for inference on Blackwell.
-2. **`Gemma4AssistantForCausalLM` speculative draft** — a full integration of Google's Gemma 4 Assistant draft head: HF → GGUF conversion, a new C++ architecture (`LLM_ARCH_GEMMA4_ASSISTANT`), a custom speculative driver, and the optimization work that makes it actually accelerate a Gemma 4 31B backbone in `llama-server`.
+**Headline numbers** — Gemma 4 31B NVFP4 target + Gemma 4 31B Assistant f16 draft, RTX PRO 4500 Blackwell (32 GiB), 128K context, K=1, caching on:
 
-The two pieces are independent but designed to coexist: the target (Gemma 4 31B) is NVFP4-quantized so it fits in 32 GiB of VRAM at 128K context, and the draft (the assistant head, ~470M, kept in f16) runs alongside it on the same GPU.
-
----
-
-## TL;DR
-
-- `llama-quantize <fp16>.gguf <out>.gguf NVFP4` now works (and `NVFP4_MOE` for MoE experts-only).
-- `--spec-type draft-gemma4-assistant` runs the assistant draft against a Gemma 4 31B target in `llama-server`.
-- Measured on RTX PRO 4500 Blackwell (32 GiB), Gemma 4 31B NVFP4 target + f16 assistant draft, 128K context:
-  - **~22–25 tok/s generation at ~30K context** with speculation on (K=1).
-  - **~28% per-draft acceptance** (this is the NVFP4-target ceiling — see §6).
-  - **Caching + speculation coexist** (Phase E backfill).
-  - Memory: ~27 GiB total (target 16.8 + draft KV ~1 + draft model ~0.9 + draft compute + slot caches).
-
----
-
-## 1. Background
-
-### Why a "draft" model at all
-
-Speculative decoding accelerates generation by having a small, fast *draft* model propose the next K tokens, which the target then verifies in a single batched forward. Accepted drafts are emitted as if the target had decoded them; rejected ones are discarded. Output is *lossless* — bit-identical to running the target alone.
-
-### What `Gemma4AssistantForCausalLM` actually is
-
-This is a critical point that reshaped the whole integration. The HF arch name suggests a model. It is not. Inspecting `transformers/models/gemma4_assistant/modeling_gemma4_assistant.py` shows:
-
-- `forward()` **ignores `input_ids`** and *requires* `inputs_embeds` (backbone hidden states) plus `shared_kv_states` (the backbone's K/V from its last full-attention and last sliding-attention layers).
-- The draft has **no `k_proj` / `v_proj` / `k_norm`** — only `attn_q` + `attn_q_norm`. It cannot compute its own K/V; it *must* cross-attend over the backbone's K/V.
-- It runs a dense Gemma 4 text stack (4 layers, hidden 1024) with a `pre_projection` (`2·backbone_hidden → hidden`) on input and a `post_projection` (`hidden → backbone_hidden`) on output, fed by an autoregressive chain at a *fixed RoPE position* (NVIDIA / HF's `SinglePositionMultiTokenCandidateGenerator`).
-
-So the assistant is a **draft head bolted to a specific backbone arch (Gemma 4)**. It cannot produce text on its own. Wiring it into llama.cpp's pluggable speculative framework required novel machinery that none of the existing draft types (`draft-simple`, `draft-eagle3`, `draft-mtp`) handled:
-
-- Capture the backbone's K/V from a running target context and pipe it into a separate draft context.
-- Feed the target's last hidden state into the draft as an input embedding.
-- Drive an autoregressive chain at a fixed position rather than incrementing RoPE.
-
-### Why NVFP4
-
-NVFP4 is NVIDIA's 4-bit floating-point quantization format with **two-level scaling**:
-- Per-block (block size 16) UE4M3 scale.
-- Per-tensor FP32 `weight_scale_2 = amax / (6·448)` (a companion `.scale` tensor next to each weight).
-
-llama.cpp already had the inference-side `GGML_TYPE_NVFP4` (load + matmul) before this fork, but `llama-quantize` had no NVFP4 *output* path, so producing NVFP4 GGUFs required converting from a third-party tool. We needed to quantize the Gemma 4 31B target ourselves (the assistant head is too quirky to ship pre-quantized — only the target is). At 31B parameters and ~4.64 bpw, NVFP4 is what lets the 31B + KV cache + draft fit in a 32 GiB GPU at 128K context.
-
----
-
-## 2. What was added to llama.cpp
-
-### 2.1 NVFP4 quantize emitter (commit `35018cc2d`)
-
-`include/llama.h`, `src/llama-model-loader.cpp`, `src/llama-quant.cpp`, `tools/quantize/quantize.cpp`.
-
-- Two new ftypes: `LLAMA_FTYPE_MOSTLY_NVFP4` (all eligible 2D weights → NVFP4) and `LLAMA_FTYPE_MOSTLY_NVFP4_MOE` (experts only).
-- **Tensor selection policy:** 2D weights with row width % 64 → NVFP4; `token_embd` and `output` fall back to **Q8_0** (they have no `weight_scale_2` path in the inference kernels).
-- **Two-level scale generation:** the block scales are computed on data *pre-divided* by `weight_scale_2`, and the companion `.scale` tensor (FP32, shape `[n_experts]` for MoE or `[1]` for plain) is written *interleaved after each weight* so GGUF offsets and the streamed writes stay in lockstep.
-
-Usage:
-```bash
-llama-quantize <in>.f16.gguf <out>.nvfp4.gguf NVFP4
-llama-quantize <in>.f16.gguf <out>.nvfp4_moe.gguf NVFP4_MOE  # MoE experts only
-```
-
-The 31B Gemma 4 target compresses from ~62 GiB (f16) to ~16.8 GiB (NVFP4) — a 3.7× shrink — and the resulting GGUF runs natively on Blackwell (no CPU dequant fallback) via the existing FP4 kernels.
-
-### 2.2 `Gemma4AssistantForCausalLM` integration
-
-A multi-phase integration. Files touched (representative):
-
-- **Conversion** (`conversion/gemma.py`, `conversion/__init__.py`):
-  `Gemma4AssistantModel(Gemma4Model)` emits the dense Gemma-4 backbone + the `mtp.{pre,post}_projection` weights + assistant-specific metadata keys (`backbone_hidden_size`, `requires_target_arch=gemma4`, etc.).
-- **GGUF schema** (`gguf-py/gguf/{constants,gguf_writer,tensor_mapping}.py`):
-  `MODEL_ARCH.GEMMA4_ASSISTANT`, new `MTP_*` tensor enums, new KV keys.
-- **C++ architecture** (`src/llama-arch.{h,cpp}`, `src/llama-hparams.h`, `src/models/models.h`, `src/models/gemma4-assistant.cpp`):
-  `LLM_ARCH_GEMMA4_ASSISTANT`, `load_arch_hparams`, `load_arch_tensors`, and a custom `build_arch_graph` that does the cross-attention over external K/V tensors (no `build_attn` / no own KV cache).
-- **Staging API** (`src/llama-ext.h`):
-  `llama_gemma4_assistant_io` (the I/O the driver attaches), `llama_set_eval_callback` (installs the K/V-capture callback on the target), `llama_context_dev_buft` (so the driver can allocate device tensors the draft graph views), `llama_kv_read_layer_f32` (the Phase E backfill primitive).
-- **Speculative driver** (`common/common.h`, `common/speculative.cpp`):
-  `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`, the impl struct, the lifecycle (`begin` / `process` / `draft` / `accept`).
-- **Server wiring** (`tools/server/server-context.cpp`):
-  `--spec-type draft-gemma4-assistant`, draft context parameters (`n_batch=8`, `n_ubatch=1`), `model_path_tgt` threaded through, draft-simple auto-enable suppressed.
-
-### 2.3 Performance work on the speculative path
-
-A series of independent optimizations, each measurable, layered on top of the working integration. These are described in §5.
-
-### 2.4 Verification harnesses (`devtools/gemma4_assistant/`)
-
-`dump_hf_reference.py`, `numpy_reference.py`, `replay.cpp`, `test_decode.cpp`, `probe_kv.cpp`, `spec_run.cpp` — used during development to gate each layer of the integration against the HF reference (numpy ≤ 1e-6, ggml ≤ 1e-3, end-to-end argmax match). Some of these are now out of sync with the final embedding output shape; useful as historical reference + a starting point for re-validating future changes.
-
----
-
-## 3. Results
-
-All numbers from RTX PRO 4500 Blackwell (32 GiB), CUDA + Blackwell native FP4 kernels, single sequence (`--parallel 1`).
-
-| Metric | Value |
+| | |
 |---|---|
-| Target: Gemma 4 31B NVFP4 | 16.8 GiB on GPU |
-| Draft: gemma 4 31B assistant f16 | ~0.9 GiB on GPU + ~1 GiB device-resident shared KV |
-| Context | 131072 tokens (128K) |
-| Generation throughput at ~30K context, K=1 | **22–25 tok/s** |
-| Prompt processing | ~500–800 tok/s (cache-dependent) |
-| Per-draft acceptance (k0) | ~26–28% |
-| Avg accepted drafts/cycle | ~0.28 (so ~1.28 tokens/cycle) |
-| Draft step cost (1 step, 30K ctx) | ~10 ms |
-| Steady-state host RSS | ~27 GiB (target + draft model + slot prompt cache) |
+| Generation throughput | **22–25 tok/s** at ~30K context |
+| Per-draft acceptance (k0) | **~28%** (the NVFP4 target's ceiling — see *Key insight* below) |
+| Net gain over target-only | **+10–20% tg** |
+| Memory footprint | ~27 GiB RSS, flat across long sessions |
+| Output | **Lossless** — bit-identical to running the target alone |
 
-**Net gain over target-alone:** with all optimizations on and caching enabled, speculation is **net-positive** at long context (≈+10–20% tg). The exact gain is content-dependent; at ~28% acceptance, you get ~1.28 tokens for the price of one target verify + one draft decode (~50 ms vs ~40 ms target-alone single decode at 30K).
-
-**What does NOT pay off (measured):**
-- K=2 vs K=1: doubles `draft()` cost; second-draft acceptance (k1) is only ~2%. K=1 wins on tg.
-- Priming step to fix the `id_last/last_hidden` off-by-one: zero acceptance gain in A/B (the assistant tolerates the mismatched pair). Default off.
+**Status:** ✅ Lossless · ✅ K=1 verified end-to-end · 🟡 Single sequence only (`--parallel 1`) · 🟡 Target requires `-fa` (flash-attention) · 🟡 Gemma 4 backbone only
 
 ---
 
-## 4. The integration, phase by phase
+## What this is
 
-Reproducing the order in which things were built and validated:
+Two pieces of work, designed to coexist:
 
-### Phase A — HF → GGUF f16 conversion
+1. **NVFP4 quantize output** for `llama-quantize`. Adds the `NVFP4` and `NVFP4_MOE` ftypes with NVIDIA's two-level scaling spec — per-block UE4M3 + per-tensor FP32 `weight_scale_2`. Before this fork, llama.cpp could *load* NVFP4 tensors but not *emit* them; quantizing to NVFP4 required a third-party tool. (Commit `35018cc2d`.)
 
-`Gemma4AssistantModel(Gemma4Model)` in `conversion/gemma.py`. Emits the dense Gemma 4 backbone tensors + the `mtp.pre_projection` / `mtp.post_projection` projections + the assistant metadata. The output is **bit-for-bit identical** to a reference GGUF (49/49 tensors match by hash).
+2. **The Gemma 4 31B Assistant speculative draft**, integrated as a new arch (`LLM_ARCH_GEMMA4_ASSISTANT`) and draft type (`--spec-type draft-gemma4-assistant`). The "assistant" here is **not a standalone LLM** — it's a draft head trained to cross-attend over a Gemma 4 backbone's K/V and emit a multi-token chain at a fixed RoPE position. Wiring this into llama-server required a custom inference graph, a new speculative driver, and the engineering deltas to keep it correct and fast under the server's prompt-cache and slot-similarity reuse.
 
-### Phase B — C++ load path
+Together, they let a 31B target *fit* (NVFP4 compresses 62 → 17 GiB) and *run faster* (speculation, when the draft drafts well) on consumer-class Blackwell hardware.
 
-`LLM_ARCH_GEMMA4_ASSISTANT` factory case, hparams + tensors loaded (49/49 consumed), `build_arch_graph` initially a throwing stub (load+quantize are graph-free).
+**Why a fork and not a PR upstream?** The work is opinionated for a specific use case. The speculative integration is bonded to Gemma 4 (the assistant's required backbone) and assumes Blackwell's native FP4 kernels for performance. The NVFP4 emitter alone might be PR-worthy upstream; the assistant integration is narrow enough that it lives more comfortably here as a focused fork. If your interest is the NVFP4 emit path, [commit `35018cc2d`](../../commit/35018cc2d) is the relevant standalone change.
 
-### Phase C — Inference graph + speculative driver
-
-**The hard part.** Three subphases:
-
-**C1 — Forward, numerically verified.** Built `numpy_reference.py` and `replay.cpp` against a synthetic-but-fixed input + HF oracle (`dump_hf_reference.py`). The numpy reimpl matches HF to rel ~1e-6 at every layer; the ggml replay matches to rel ~1e-3 (f16-vs-f32 noise; argmax matches). Lots of small wins encoded here:
-- RMS norms are **w-only** (NOT 1+w like Gemma 3).
-- Attention scale is **1.0** (not 1/√d).
-- **`layer_scalar` multiplies the residual at the *end* of each layer** (was the key bug — a missing factor that broke everything).
-- Full layers use **proportional RoPE** (NEOX, theta 1e6, `freq_factors = [1]*nrot + [1e30]*(hd/2-nrot)`, `nrot = hd*0.25/2`).
-- SWA layers use a 1e4-theta full-head-dim rotation.
-- K is post-RoPE, V is normed-but-not-roped, both consumed as-is from the backbone.
-
-**C2 — Driver design.** The HF reference's data flow:
-```
-last_token_embedding = TARGET_embed(last_token_id)                # (5376,)
-inputs_embeds        = concat(last_token_embedding, last_hidden)  # (10752,) = 2*backbone
-draft.forward(inputs_embeds, shared_kv_states)
-  → next token id, next hidden  (then loop)
-```
-The driver needs from the target, per cycle: (a) the shared K/V from layers `L_full=59` and `L_swa=58`, (b) the backbone's final hidden state of the last validated token, (c) the embedding table row for each drafted token. The `cb_eval` callback path is how (a) and (b) are extracted. The driver writes the wide concat into `io.embd` and attaches all external K/V via `llama_gemma4_assistant_set_io`.
-
-**C3 — End-to-end on `llama-server`.** `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` wired into the framework; the server creates `ctx_tgt` with the K/V capture callback; lossless generation verified vs target-only.
-
-### Phase D — NVFP4 quantization
-
-Already covered in §2.1. Independent of the assistant work, but indispensable for fitting 31B + 128K KV in 32 GiB.
-
-### Phase E — KV-cache backfill (caching + speculation coexistence)
-
-`llama-server`'s prompt-cache, context-checkpoint, and **LCP slot-similarity** reuse load prefix KV into the target's cache *without re-decoding* — so `cb_eval` never fires for those positions and the driver's `acc_len` falls behind `pos0`. Misaligned KV → garbage drafts → ~0% acceptance.
-
-Phase E adds a primitive — `llama_kv_read_layer_f32(ctx, il, seq, p0, p1, k_out, v_out)` — that reads the stored post-RoPE K and normed V for a position range out of the target's own KV cache (handling the iSWA base-vs-sliding routing, the `map_layer_ids` remap, dequantization, and contiguous-run batching). When `pos0 > acc_len` the driver calls it for layers 59 and 58 over the gap, commits the result, and drafting resumes aligned. **Requires the target to run with flash-attention** (so V is non-transposed and readable as contiguous rows).
-
-The premise that justifies this: `build_attn` stores into the cache *exactly* the tensors `cb_eval` captures (`Kcur_pos`, `Vcur_normed` — verified by inspection of `src/models/gemma4.cpp:226-239`). So the cache *is* the right source.
-
----
-
-## 5. Performance optimizations
-
-Each of these landed independently and was measured against the previous baseline:
-
-1. **Device-resident full-layer KV** — store the full-layer shared K/V in a persistent device tensor (`dev_k_full`/`dev_v_full`, allocated once via `llama_context_dev_buft`) that the draft graph *views* with `ggml_view_3d`. Replaces a ~0.5–1 GiB host→device copy *per draft step* at 128K. Big PCIe-bound win at long context.
-
-2. **SWA host accumulation windowing** — the sliding-attention layers only ever read the last `sliding_window` (1024) positions, so the host buffer is trimmed in `commit()` to that window. Bounds host memory at ~8 MiB instead of growing to ~1–2 GiB at 128K.
-
-3. **F16 KV inputs** — halve the on-GPU input size for the host-fallback KV path (the device path uses the device F16 storage natively).
-
-4. **`cap_*` → `vbuf_*` lifecycle fix** (the OOM-killer). Originally `cap_*` (the per-decode `cb_eval` capture) was only cleared on the seed decode and in `accept()`. Re-prefills and the server's checkpoint-restore path bypassed both → `cap_*` accumulated across decodes into tens of GiB and the kernel OOM-killed the server. Fixed: `process()` *always* consumes and clears `cap_*` in the same call, handing the verify capture to `accept()` through a small saved buffer (`vbuf_*`, one verify batch ≈ K+1 positions). Leak-proof regardless of whether `accept()` runs.
-
-5. **Position-aligned commits + `truncate_to`** — the verify batch sets `pos0 = pos_next() = #confirmed tokens`, so the invariant is `pos0 == acc_len`. When the server reuses a prefix and starts at `pos0 < acc_len` (LCP slot reuse), the driver now truncates its committed state to `pos0` instead of letting `acc_len` drift ahead (which was producing a ~930-position offset and collapsing acceptance to ~0%).
-
-6. **Phase E backfill** — see §4 above. Closes the `pos0 > acc_len` direction (caching restores).
-
-7. **`post_projection` on-device** — apply `mtp.post_projection` in the draft graph itself and expose the backbone-space hidden as the embeddings output (widen `hparams.n_embd_out_impl` to `n_embd_backbone`). Eliminates a ~7 ms/step host matmul over the 22 MiB projection weight.
-
-8. **Lighter `memory_clear`** — the draft writes no KV and never reads its own cache, so `llama_memory_clear(mem, /*data=*/false)` (reset metadata only, don't zero the GPU buffers) is sufficient. Cheap win per step.
-
-9. **`kv_len_full` bucketing + `can_reuse` override → draft graph reuse + CUDA graphs.** The single biggest fixed-overhead win. `llm_graph_input_i::can_reuse` defaults to **false**, so the custom gemma4_assistant input never opted into reuse → the draft graph was rebuilt on *every single decode* (no CUDA graph either). Fix: bucket `kv_len_full` to a multiple of 512 and mask the padded positions in the full-layer softmax with `ggml_soft_max_ext` (exact: `exp(-inf)=0`). With `kv_len_swa` steady at the window after warmup, the graph shape is now constant until `acc_len` crosses a 512-bucket boundary — rebuilds every ~365 cycles instead of every step. Implements `can_reuse` to match the bucket. Decode dropped from ~12 ms/step to ~5 ms/step at moderate context.
-
-10. **GPU argmax + skip the draft logits readback** — compute `ggml_argmax(logits)` on-device, cast to F32, concat as a +1 tail on the embeddings output (`[hidden | argmax_token]` per token). Set `res->t_logits = nullptr` so the framework skips the **1 MiB host logits readback** entirely. The graph still computes logits as an internal node (because argmax depends on it); they just never leave the GPU. Driver reads the +1 tail and casts F32→`llama_token` (lossless for vocab ≪ 2²⁴). Eliminates the readback + the 262K-vocab host argmax loop.
-
-11. **K=1 default (recommended via `--spec-draft-n-max 1`).** A/B'd against K=2 on the same content: identical `avg_acc` (~0.28), but K=2 doubles `draft()` cost — net tg loss. The second draft step's in-chain acceptance (k1) is ~2%; it never pays for itself at this acceptance ceiling.
-
-12. **Priming step (off by default).** Implemented the matched-pair seed (`step(last_tok, last_hidden)` to bootstrap `est_hidden@acc_len`, then draft from the real `id_last`) — exactly spec_run's chain. A/B showed **identical k0** (~17.5%) with and without priming. The assistant tolerates the off-by-one; the extra step is pure cost. `G4A_PRIME=1` re-enables it as an experiment toggle.
-
----
-
-## 6. The acceptance ceiling
-
-This is the single most important empirical result for understanding why speculation here is *net-positive but bounded*.
-
-**The realistic per-draft acceptance is ~25–30%** — meaning at K=1 you get an average of ~1.28 tokens per target-decode cycle. The headline number that floated around development was **32% k=0 raw match** from `spec_run` at *very short context*, which is `argmax(draft)==argmax(target)` regardless of chain state. End-to-end (in-chain) acceptance — which is what actually matters — is materially lower: ~15.8% in `spec_run`'s K=2 run at short context, ~28% at long context in production.
-
-**Why this is the ceiling, not a bug we should chase further:** the draft was trained against the *full-precision* backbone. We run it against an **NVFP4-quantized** backbone whose attention and matmul outputs differ from the full-precision targets the draft expects, in a way the draft can't compensate for. The acceptance budget is paid by that quantization mismatch.
-
-What we proved by ablation:
-- **Off-by-one (token, hidden) pairing is not the bottleneck.** Priming gave 0% lift.
-- **The KV transport (device-view vs host-copy) is not the bottleneck.** A/B gave 1.4% vs 3% — within noise, mostly content-dependent.
-- **Bucketing/reuse and GPU argmax don't change acceptance** (math is exact).
-- **K>1 doesn't help acceptance.** k1 ≈ 2%, k2 ≈ 0%.
-
-What *would* lift it (and isn't pursued in this fork): running a higher-precision target. Q8_0 31B is ~33 GiB and doesn't fit; f16 is ~62 GiB. NVFP4 is the only way to fit 31B in 32 GiB at 128K, and that's the trade-off.
-
----
-
-## 7. How to use it
-
-Assumptions: an HF checkpoint of `google/gemma-4-31B` (or your private equivalent) plus `google/gemma-4-31B-it-assistant`. Blackwell GPU. flash-attention enabled.
+## Quick start
 
 ```bash
-# 1. Convert backbone HF -> GGUF f16
-python convert_hf_to_gguf.py /path/to/gemma-4-31B          --outtype f16 \
-    --outfile /models/gemma-4-31B.f16.gguf
+# 1. Convert backbone HF → GGUF f16
+python convert_hf_to_gguf.py /path/to/gemma-4-31B \
+    --outtype f16 --outfile /models/gemma-4-31B.f16.gguf
 
-# 2. Convert assistant HF -> GGUF f16
-python convert_hf_to_gguf.py /path/to/gemma-4-31B-it-assistant --outtype f16 \
-    --outfile /models/gemma-4-31B-it-assistant.f16.gguf
+# 2. Convert assistant HF → GGUF f16 (the draft stays f16 — it's small)
+python convert_hf_to_gguf.py /path/to/gemma-4-31B-it-assistant \
+    --outtype f16 --outfile /models/gemma-4-31B-it-assistant.f16.gguf
 
-# 3. Quantize the target to NVFP4 (the draft stays f16 -- it's tiny)
+# 3. Quantize the target to NVFP4
 ./build/bin/llama-quantize /models/gemma-4-31B.f16.gguf \
-                          /models/gemma-4-31B.NVFP4.gguf NVFP4
+                           /models/gemma-4-31B.NVFP4.gguf NVFP4
 
 # 4. Run llama-server
 ./build/bin/llama-server \
     --model       /models/gemma-4-31B.NVFP4.gguf \
     --model-draft /models/gemma-4-31B-it-assistant.f16.gguf \
     --spec-type draft-gemma4-assistant \
-    -c 131072 \
-    -ngl all -ngld all \
+    -c 131072 -ngl all -ngld all \
     --cache-type-k q8_0 --cache-type-v q5_1 \
-    --flash-attn on \
-    --kv-unified \
-    --parallel 1 \
-    --spec-draft-n-max 1
+    --flash-attn on --kv-unified \
+    --parallel 1 --spec-draft-n-max 1
 ```
 
-Mandatory flags and why:
-- `--parallel 1` — the driver is single-sequence; multi-seq aborts with a clear error.
-- `--flash-attn on` — required for Phase E backfill (so `v_trans=false`).
-- `--spec-draft-n-max 1` — K=1 wins at this acceptance ceiling.
-- `-c 131072` (or whatever you want, up to the model's max) — speculation works at all context lengths but the win grows with context (since target verify is the bigger cost there).
+**Mandatory flags and why:**
 
-Tunable env vars (defaults shown):
-- `G4A_HOST_KV=0` — use the device-view full KV path (faster). `=1` to fall back to host (debug; per-step host→device copy).
-- `G4A_PRIME=0` — priming step off (zero acceptance gain in our A/B). `=1` to re-enable as an experiment.
-- `G4A_DEBUG_KV` — devtool-only knob in `spec_run.cpp`; not used by the server.
+- `--parallel 1` — the driver is single-sequence; otherwise it aborts at startup with a clear error.
+- `--flash-attn on` — the KV-cache-backfill path (Phase E, below) reads V as contiguous rows; without flash-attention V is transposed and the read returns `-1` (drafting then pauses gracefully — caching + speculation no longer coexist).
+- `--spec-draft-n-max 1` — at this acceptance level the second draft step contributes ~2% in-chain acceptance, not worth its ~10 ms cost. K=1 wins on throughput. See *Key insight* below.
 
-The server will print, periodically, lines like:
+**Optional env vars:**
+
+- `G4A_HOST_KV=1` — use the host KV fallback path (debug; the default device-view path is faster).
+- `G4A_PRIME=1` — re-enable the off-by-one priming step (A/B'd: zero acceptance gain, default off; see *Key insight*).
+
+When it's running, you'll see periodic telemetry like:
+
 ```
-g4a time[cyc=N acc_len=A]: draft()=X ms/call | per step: decode=Y ms sample+read=Z ms (n_step=S) prime=0 dft_graphs_reused=R
-g4a accept[cycles=N]: k0=KK.K% k1=L.L% avg_acc=A.AA drafts/cycle
-g4a mem[cyc=N]:   rss=R MiB acc_len=A kv=dev | acc_kf/vf=A/B MiB | acc_ks/vs=C/D MiB | vbuf=E MiB
-g4a: backfilled N shared-KV positions [a,b) from target cache (swa rows c/d); realigned
+g4a time[cyc=N acc_len=A]: draft()=10.5 ms/call | per step: decode=7.0 ms sample+read=3.5 ms (n_step=N) prime=0 dft_graphs_reused=R
+g4a accept[cycles=N]: k0=27.9% k1=0.0% avg_acc=0.28 drafts/cycle
+g4a mem[cyc=N]: rss=R MiB acc_len=A kv=dev | acc_kf/vf=0/0 MiB | acc_ks/vs=8/8 MiB | vbuf=0 MiB
+g4a: backfilled 546 shared-KV positions [0,546) from target cache (swa rows 221/546); realigned
 ```
 
-These are the production telemetry. `k0` is the headline acceptance number (per-draft); `dft_graphs_reused` should climb monotonically; `acc_len` should equal the `pos0` in the corresponding `proc` line; backfill lines fire when caching restores a prefix.
+`k0` is the headline acceptance number (per-draft success rate). `dft_graphs_reused` should climb monotonically — if it stays at 0, graph reuse isn't engaging. Backfill lines fire when the server restored a prefix without re-decoding it.
+
+## What this does NOT do
+
+- **Multi-sequence serving.** `--parallel > 1` is rejected at startup.
+- **Non-Gemma-4 backbones.** The assistant draft is bonded to Gemma 4 by design (no `k_proj`/`v_proj`; it must cross-attend over the backbone's K/V). Different backbones would each need their own assistant.
+- **Magic acceptance numbers.** Per-draft acceptance plateaus at ~25–30%, and this is *not* a draft-quality bug to be optimized away — it's the NVFP4 target's ceiling. See next section.
+- **Production load balancing, batching, replication.** Same as upstream llama.cpp — it's a runtime, not a serving platform.
+
+## Key insight: the acceptance ceiling
+
+This is the single most important finding for anyone evaluating speculative decoding on quantized targets.
+
+**The realistic per-draft acceptance here is ~25–30%.** That means at K=1 you average ~1.28 tokens per target-decode cycle, and the speculation budget is what you can buy with that 28% edge against the cost of running the draft.
+
+**Why this is the ceiling, not a bug we should chase further:** the assistant draft was trained against the *full-precision* backbone. We run it against an **NVFP4-quantized** backbone whose attention outputs differ from the full-precision targets the draft expects, in a way the draft itself cannot compensate for. The acceptance budget is paid by that quantization mismatch.
+
+What we proved by ablation (with the per-k stats in `g4a accept[…]`):
+
+| Lever we tried | Effect on k0 | Verdict |
+|---|---|---|
+| **Priming step** to fix the `id_last` / `last_hidden` off-by-one pairing | identical (~17.5% pre-priming vs ~17.5% with priming, on the same content) | The assistant tolerates the mismatch. Off by default. |
+| **Device-resident vs host KV transport** | within noise (~1.4% vs ~3% across different runs / content) | KV path doesn't determine acceptance. Device is now default for perf reasons. |
+| **K=2 instead of K=1** | k1 ≈ 2.2% in-chain (so +~0.02 accepted tokens/cycle) | Doubles `draft()` cost; net tg loss. K=1 wins. |
+| **Bucketing + graph reuse + GPU argmax** | unchanged by construction (math is exact) | Pure speed wins, no acceptance effect. |
+
+What *would* lift the ceiling, and isn't pursued here: running a higher-precision target. Q8_0 of a 31B is ~33 GiB and doesn't fit on a 32 GiB card; f16 is ~62 GiB. NVFP4 is what makes 31B + 128K KV fit in 32 GiB at all. That's the trade.
 
 ---
 
-## 8. Limitations and what would lift the ceiling
+## Results in detail
 
-**Hard limits in this fork:**
-- **Single sequence.** Multi-seq would need per-seq state in the driver (acc_len, last_hidden, vbuf, etc.) and a multi-stream KV plan. Not done.
-- **Requires flash-attention on the target.** The KV-cache backfill (Phase E) reads contiguous V rows; without `-fa` V is transposed and the read API returns -1.
-- **Gemma 4 only.** The target's `sliding_window_pattern` and the layer indices (`L_full=59`, `L_swa=58`) are derived from `n_layer` modulo 6. Different Gemma 4 sizes (other than 31B) would work; non-Gemma-4 backbones would not — by design, the assistant is bonded to its backbone.
+Methodology: RTX PRO 4500 Blackwell (32 GiB), CUDA + Blackwell native FP4 kernels, single sequence, default flags above, real prompts from typical use (mixed coding-assistant content, varying context lengths). Numbers from `llama-server`'s `eval time` and the driver's own per-cycle telemetry.
 
-**Soft limits (could be revisited):**
-- **K=2 doesn't help.** A k=1 acceptance of ~2% at this draft means a second step's expected yield is ~0.02 tokens, far below the ~10 ms step cost. If a future draft (different training, different precision target) raised k0 *and* k1, K>1 might pay off again.
-- **The ~28% per-draft acceptance ceiling is NVFP4-target-bound.** A higher-precision target would lift it. None fits in 32 GiB at this size.
-- **`spec_run` and `test_decode` devtools** assume the old (pre-on-device-post_proj) embedding-output shape and would need a one-line update before they can be re-used as numerical gates.
+| Metric | Value | Notes |
+|---|---|---|
+| Target on GPU | 16.8 GiB | Gemma 4 31B NVFP4 (was 62 GiB at f16) |
+| Draft on GPU | ~0.9 GiB | Assistant f16; tiny model |
+| Device-resident shared KV | ~1 GiB | Full-layer KV the draft graph views (no per-step copy) |
+| Per-cycle draft() at 30K | ~10–11 ms | 1 step × (decode 7 ms + sample+read 3.3 ms) |
+| Per-cycle target verify | ~40 ms | Includes the [id_last, draft_0..] batch |
+| Cumulative tg, K=1, 30K | 22–25 tok/s | Varies by content predictability |
+| Cumulative tg, K=2, 25K | 20.9–21.5 tok/s | Same acceptance but doubled draft cost |
+| Steady-state RSS | ~27 GiB | Target + draft + slot prompt-cache (bounded) |
+| Prompt processing | ~500–800 tok/s | Cache-dependent; not the focus of this work |
 
----
+A few things the per-step breakdown reveals:
 
-## 9. What we learned about llama.cpp's graph-reuse machinery
+- **Decode time scales with context.** At ~2.5K: ~5 ms/step. At ~30K: ~13 ms/step. That's the full-attention layer's compute over the bucketed `kv_len_full`. Inherent, not overhead.
+- **`sample+read` ≈ 3.3 ms** absorbs the GPU sync after `llama_decode`. With on-device argmax (commit `d9bbdeeaf`), the 1 MiB logits readback is gone and the 262K-vocab host argmax loop is gone; what's left is the GPU sync attribution plus the small embeddings copy (`n_embd_backbone+1` floats).
+- **`dft_graphs_reused` climbs by ~K per cycle** in steady state — the draft graph is reused, CUDA graphs engaged. Before bucketing + `can_reuse` override (commit `1732ad5f3`), the draft graph rebuilt on every single decode (~10 ms/step fixed overhead).
 
-A discovery that surprised us and is probably useful to anyone implementing a custom architecture:
+## How it works
 
-- `llm_graph_input_i::can_reuse` returns **false** by default. If your custom graph input doesn't override it, your graph is rebuilt on *every* decode — including CUDA-graph capture being disabled, which can be a ~10 ms fixed cost per step for even a small model.
-- Reuse engages when:
-  1. The graph params (`llm_graph_params::allow_reuse`) say so — typically the case for steady decode (n_tokens=1, n_outputs=1, gtype unchanged).
-  2. Every input in the result implements `can_reuse` and returns true.
-- For shapes that change every cycle (like our `kv_len_full = acc_len`), bucket them to a quantum and mask out the padding in the relevant op. `ggml_soft_max_ext` with a mask of `[0, ..., 0, -inf, ..., -inf]` is exact (the padded positions contribute 0 to softmax and therefore 0 to the attention output).
+A few load-bearing facts that surprised us during the integration:
 
-The ~10 ms/step rebuild penalty is invisible until measured; it doesn't show up in the target-side `graphs_reused` counter (that's per-context) and there's no per-decode warning. The `llama_perf_context(ctx_dft).n_reused` counter is the diagnostic; if it stays at 0 while you decode many tokens, you're not reusing.
+**The assistant is not a standalone LLM.** Inspecting `transformers/models/gemma4_assistant/modeling_gemma4_assistant.py` reveals:
 
----
+- `forward()` *ignores* `input_ids` and requires `inputs_embeds` (backbone hidden states) plus `shared_kv_states` (backbone's K/V from its last full-attention + last sliding-attention layers).
+- The model has **no `k_proj` / `v_proj` / `k_norm`** — only `attn_q` + `attn_q_norm`. It cannot compute its own K/V; it must cross-attend over the backbone's.
+- It runs a 4-layer dense Gemma 4 text stack with `pre_projection` (`2·backbone_hidden → hidden`) on input and `post_projection` (`hidden → backbone_hidden`) on output, in an autoregressive chain at a **fixed RoPE position** (NVIDIA's `SinglePositionMultiTokenCandidateGenerator`).
 
-## 10. What we learned about acc_len / pos0 alignment
+So "the assistant model" is a draft head bolted to a specific backbone arch. Driving it inside llama.cpp's pluggable speculative framework needed novel pieces none of the existing draft types (`draft-simple`, `draft-eagle3`, `draft-mtp`) handled:
 
-`llama-server` has *three* ways the target's KV gets prefix tokens without re-decoding them:
+- A way to **capture the backbone's K/V from a running target context** and pipe it into a separate draft context — done via a `cb_eval` callback installed on `ctx_tgt` that intercepts `Kcur_pos-{N}` and `Vcur_normed-{N}` tensors as the target decodes.
+- A way to **feed the target's last hidden state into the draft as an input embedding** — done by enabling embeddings on the target, reading them in `process()`, and packing into the driver's `io.embd`.
+- An **autoregressive chain at a fixed position** rather than incrementing RoPE — implemented in the driver's `draft()` as K small `llama_decode` calls with the same `pos=acc_len-1`, threading the post-projected hidden forward each step.
 
-1. `--cache-ram <N>` — cross-request **prompt cache**.
-2. `--ctx-checkpoints <N>` — per-slot **context checkpoints** (SWA-bounded snapshots).
-3. **LCP slot-similarity reuse** (always on; `--slot-prompt-similarity` controls the threshold).
+**Caching + speculation coexist.** The trickiest part of the integration wasn't the forward — it was staying aligned with llama-server's prompt-cache, context-checkpoint, and LCP slot-similarity reuse. All three can restore prefix K/V into the target's cache *without re-decoding it*, so `cb_eval` never fires for those positions and the driver's committed length lags the target's. The fix has two parts:
 
-Any of them can cause `pos0 > acc_len` (the driver missed positions the target has). The first two can be disabled with flags; the third is fundamental to how the server schedules work and can't be turned off without sacrificing all of the prefill efficiency.
+- **`pos0 < acc_len`** (rewind to a shorter prefix) → `truncate_to(pos0)` drops the divergent tail; the prefix's K/V is still valid since LCP means the tokens are identical.
+- **`pos0 > acc_len`** (capture gap; a restored prefix the driver didn't build) → `backfill_gap(pos0)` reads the missing K/V layer-by-layer out of the target's own KV cache (new staging API `llama_kv_read_layer_f32`, see `src/llama-kv-cache.cpp`), dequantizes to f32, and commits.
 
-So a robust draft *must* tolerate restores. Two complementary mechanisms ended up being necessary:
+`pos0 == acc_len` is the invariant; the rewind/backfill pair maintains it across every restore the server can do.
 
-- **`truncate_to(pos0)` on `pos0 < acc_len`** — handles rewinds (server reusing a *shorter* prefix than what the driver had committed). The full-layer KV for positions `[0, pos0)` stays valid since it's the same tokens; the SWA window is cleared and refills naturally.
-- **`backfill_gap(pos0)` on `pos0 > acc_len`** — handles forward gaps (server restored a longer prefix than the driver knows). Reads layers 58/59 of the target's KV cache for `[acc_len, pos0)`, commits them, drafting resumes aligned.
+## What was added to llama.cpp
 
-Together with `if (pos0 == 0) reset_state()` they cover every restore the server can do.
+A quick map of where the work lives:
 
----
+### NVFP4 quantize emitter (commit `35018cc2d`)
 
-## 11. Commit log (selected)
-
-Reverse chronological, just the entries that map onto sections above. See `git log` for the full sequence.
-
-| Commit | Theme |
+| File | What's in it |
 |---|---|
-| `d9bbdeeaf` | GPU argmax + skip logits readback |
-| `1732ad5f3`,`c973d1100` | kv_len bucketing + can_reuse + mask shape fix |
-| `df94fdc79`,`a07e9d269` | Priming step + A/B (default off) |
-| `e2752a07c`,`409ea27ab` | Phase E KV-cache backfill |
-| `6db18160a` | Graceful pause on capture gap |
-| `ae8ea24f9` | post_projection on-device, lighter clear, K cap |
-| `02e4647ac` | Position-alignment fix (the +930 desync) |
-| `20bc5e914` | SWA host windowing |
-| `46285cbae` | Multi-seq guard + the host-RAM OOM fix (cap → vbuf) |
-| `89fefbcea` | Device-resident full-layer KV |
-| `87f55b8fe` | SWA windowing + F16 KV inputs |
-| `f2af48229`,`b6c868c12`,`b6578e958` | Eval-callback persistence, draft n_ubatch fixes |
-| `febaa0cce`,`a1e6229a1` | First end-to-end lossless speculation + NVFP4 mtp scales |
-| `0213ea440` | cb_eval probe confirming target KV extraction |
-| `d4103e91c`,`fee3b0f0e`,`b9faf9dd8` | Inference graph, ggml replay, numpy reference (Phase C1) |
-| `9fbae1b16` | HF→GGUF + arch load path + initial NVFP4 wiring (Phase A/B) |
-| `35018cc2d` | NVFP4 quantize emitter |
+| `src/llama-quant.cpp` | The bulk: ftype dispatch, two-level scale computation, interleaved `.scale` tensor emit |
+| `include/llama.h` | `LLAMA_FTYPE_MOSTLY_NVFP4`, `LLAMA_FTYPE_MOSTLY_NVFP4_MOE` |
+| `tools/quantize/quantize.cpp` | CLI registration |
+| `src/llama-model-loader.cpp` | Recognize the new ftype tags |
 
-Most of these commits include `Co-Authored-By: Claude` trailers reflecting the pair-programming workflow.
+Block scales are computed on data **pre-divided** by `weight_scale_2 = amax / (6·448)`, and the companion FP32 scale tensor (shape `[1]` plain or `[n_experts]` for MoE) is emitted *interleaved* after each weight so GGUF offsets and the streamed writes stay in lockstep. `token_embd` and `output` fall back to **Q8_0** (no `weight_scale_2` path in the inference kernels). 2D weights need row width % 64 to be eligible.
+
+### Gemma 4 Assistant integration
+
+| File | What's in it |
+|---|---|
+| `conversion/gemma.py`, `conversion/__init__.py` | HF → GGUF for `Gemma4AssistantForCausalLM` |
+| `gguf-py/gguf/{constants,gguf_writer,tensor_mapping}.py` | New arch + `mtp.*` tensors in the GGUF schema |
+| `src/llama-arch.{h,cpp}`, `src/llama-hparams.h` | `LLM_ARCH_GEMMA4_ASSISTANT`, KV keys, hparams |
+| `src/models/models.h`, `src/models/gemma4-assistant.cpp` | Model struct, load path, custom `build_arch_graph` |
+| `src/llama-ext.h` | Staging APIs: `llama_gemma4_assistant_io`, `llama_set_eval_callback`, `llama_context_dev_buft`, `llama_kv_read_layer_f32` |
+| `src/llama-context.{h,cpp}` | Eval-callback persistence, `dev_buft` impl, KV read routing |
+| `src/llama-kv-cache.{h,cpp}` | `read_layer_f32` (the Phase E read primitive) |
+| `common/common.h`, `common/speculative.cpp` | New draft type + impl (the bulk of the runtime integration) |
+| `tools/server/server-context.cpp` | `--spec-type draft-gemma4-assistant` wiring + draft-context tuning |
+| `devtools/gemma4_assistant/*` | HF oracle, numpy reference, ggml replay, probes, standalone speculator |
+
+### Performance optimizations applied
+
+Twelve independent improvements layered on the working integration:
+
+| # | Optimization | Commit | What it bought |
+|---|---|---|---|
+| 1 | Device-resident full-layer KV | `89fefbcea` | Eliminates ~0.5–1 GiB host→device copy per step |
+| 2 | SWA host accumulation windowing | `20bc5e914` | Bounds host memory ~8 MiB instead of ~1–2 GiB |
+| 3 | F16 KV inputs | `87f55b8fe` | Halves on-GPU input size |
+| 4 | `cap_*` → `vbuf_*` lifecycle | `46285cbae` | **Closed the host-RAM OOM** (cap accumulation across decodes) |
+| 5 | `truncate_to` on `pos0 < acc_len` | `02e4647ac` | Fixes the ~930-pos desync from prefix reuse |
+| 6 | Phase E backfill on `pos0 > acc_len` | `e2752a07c` | Caching + speculation coexist |
+| 7 | `post_projection` on-device | `ae8ea24f9` | Eliminates ~7 ms/step host matmul |
+| 8 | `memory_clear(false)` (metadata only) | `ae8ea24f9` | Skip per-step GPU-buffer zeroing |
+| 9 | `kv_len_full` bucketing + `can_reuse` | `1732ad5f3`, `c973d1100` | **Biggest fixed-overhead win.** Draft decode ~12 → ~5 ms/step |
+| 10 | GPU argmax + skip logits readback | `d9bbdeeaf` | Eliminates 1 MiB GPU→host transfer + 262K host argmax |
+| 11 | K=1 default (`--spec-draft-n-max 1`) | (operational) | A/B'd K=2; identical avg_acc, doubled cost. K=1 wins |
+| 12 | Priming step off by default | `df94fdc79` | A/B'd; zero acceptance gain at this content/ceiling |
 
 ---
 
-## 12. Closing notes
+## The integration, phase by phase
 
-The speculative draft is **net-positive but the gain is bounded by the NVFP4 target's acceptance ceiling**, not by the draft's speed. Most of the engineering effort after the integration worked focused on (a) keeping it correct under the server's restore behaviors and (b) closing the per-decode fixed overheads (graph rebuild, host argmax, KV transport) so the speculation's small acceptance edge actually translates into tg. We got there.
+For readers interested in the engineering arc:
 
-The NVFP4 quantize emitter is independent and the more broadly reusable piece — it's not Gemma-4-specific and lets anyone quantize a model to NVFP4 with llama.cpp alone.
+### Phase A — HF → GGUF f16 conversion
 
-For an entry-level reader, the headline takeaways:
+`Gemma4AssistantModel(Gemma4Model)` in `conversion/gemma.py`. Emits the dense Gemma 4 backbone tensors + the `mtp.{pre,post}_projection` projections + assistant-specific metadata keys (`backbone_hidden_size`, `requires_target_arch=gemma4`, etc.). The output is **bit-for-bit identical** to a reference GGUF (49/49 tensors match by hash).
 
-- You *can* run a Gemma 4 31B + its real speculative draft on a 32 GiB consumer-class Blackwell GPU at 128K context, losslessly, with caching and speculation cooperating.
-- The win is real (≈+10–20% tg) but capped by the NVFP4 target. If someone publishes a higher-precision compressed Gemma 4 31B (or smaller / better-trained drafts), this scaffolding accelerates immediately without code changes.
-- Implementing a custom speculative draft against `llama-server`'s caching, slot, and KV machinery surfaces a lot of structural assumptions in the runtime; the work above documents (and patches) the load-bearing ones.
+### Phase B — C++ load path
+
+`LLM_ARCH_GEMMA4_ASSISTANT` factory case, hparams + tensors loaded (49/49 consumed), `build_arch_graph` initially a throwing stub. Quantize + model-load were exercisable before the graph existed.
+
+### Phase C — Inference graph + speculative driver
+
+The hard part. Three substages:
+
+**C1 — Forward, numerically verified.** Built `numpy_reference.py` and `replay.cpp` against a synthetic-but-fixed input + HF oracle (`dump_hf_reference.py`). The numpy reimpl matches HF to rel ~1e-6 at every layer; the ggml replay matches to rel ~1e-3 (f16-vs-f32 noise; argmax matches). Encoded findings:
+
+- RMS norms are **w-only** (NOT 1+w like Gemma 3).
+- Attention scale is **1.0** (not 1/√d).
+- **`layer_scalar` multiplies the residual at the *end* of each layer** — was the key bug. A missing factor that broke everything until we caught it via the numpy oracle.
+- Full layers: proportional RoPE (NEOX, theta 1e6, `freq_factors = [1]*nrot + [1e30]*(hd/2-nrot)`, `nrot = hd*0.25/2`).
+- SWA layers: theta-1e4 full-head-dim rotation.
+- K is post-RoPE, V is normed (no RoPE), both consumed as-is from the backbone.
+
+**C2 — Driver design.** The HF reference's data flow per draft step:
+```
+last_token_embedding = TARGET_embed(last_token_id)                # (5376,)
+inputs_embeds        = concat(last_token_embedding, last_hidden)  # (10752,) = 2·backbone
+draft.forward(inputs_embeds, shared_kv_states)
+  → next token id, next hidden  (then loop)
+```
+The driver needs from the target per cycle: (a) the shared K/V from layers `L_full=59` and `L_swa=58`, (b) the backbone's final hidden state of the last validated token, (c) the embedding-table row for each drafted token. The `cb_eval` callback path is how (a) and (b) are extracted. The driver writes the wide concat into `io.embd` and attaches all external K/V via `llama_gemma4_assistant_set_io`.
+
+**C3 — End-to-end on `llama-server`.** `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` wired into the framework; the server creates `ctx_tgt` with the K/V capture callback; lossless generation verified vs target-only.
+
+### Phase D — NVFP4 quantization
+
+Covered above. Independent of the assistant work, but indispensable for fitting 31B + 128K KV in 32 GiB.
+
+### Phase E — KV-cache backfill (caching + speculation coexistence)
+
+The capture-gap problem and the `llama_kv_read_layer_f32` primitive that solves it. The premise that justifies it: `build_attn` (`src/llama-graph.cpp`) stores into the cache *exactly* the tensors `cb_eval` captures — see `src/models/gemma4.cpp:226-239` — so the cache *is* the right source. The read path handles iSWA base-vs-sliding routing, `map_layer_ids` remap, dequantization, and contiguous-run batching. Requires the target to run with flash-attention (so V is non-transposed).
+
+## Performance optimizations explained
+
+For each of the twelve from the table above, the "why" — these are the gritty bits useful to anyone implementing a similar integration.
+
+### Device-resident full-layer KV (`89fefbcea`)
+
+Before: the driver memcpy'd the full-layer KV host → device on every draft step (~0.5–1 GiB at 128K, PCIe-bound). Now the full-layer KV lives in a persistent device tensor (`dev_k_full`, `dev_v_full`, allocated once via `llama_context_dev_buft`) that the draft graph *views* with `ggml_view_3d`. `commit()` appends newly-validated positions (f32→f16) to the device tensor; the graph reads from there directly.
+
+### SWA host accumulation windowing (`20bc5e914`)
+
+The draft's sliding-attention layers only read the last `sliding_window` (1024) positions. The host buffer (`acc_ks`, `acc_vs`) was growing to full-context size before this fix. `commit()` now drops older positions, keeping the host accumulation flat at ~8 MiB instead of ~1–2 GiB at 128K.
+
+### F16 KV inputs (`87f55b8fe`)
+
+The host-fallback KV path was feeding f32 to the graph and doing the cast on-device. Switched to f16 host storage (the data is already low precision at capture time), halving the input transfer size for the host path.
+
+### `cap_*` → `vbuf_*` lifecycle (`46285cbae`) — the OOM-killer
+
+The original capture lifecycle was: `cb_eval` appends to `cap_*` (per-decode capture); the seed decode and `accept()` cleared it. The server's checkpoint-restore path and re-prefills bypassed both → `cap_*` accumulated across decodes into tens of GiB and the kernel OOM-killed the server. Fixed by making `process()` *always* consume and clear `cap_*` in the same call, handing the verify capture to `accept()` through a small saved buffer (`vbuf_*`, one verify batch ≈ K+1 positions). Leak-proof regardless of whether `accept()` runs.
+
+### Position-aligned commits + `truncate_to` (`02e4647ac`)
+
+The verify batch sets `pos0 = pos_next() = #confirmed tokens`, so the invariant is `pos0 == acc_len`. When the server reuses a prefix and starts at `pos0 < acc_len` (LCP slot reuse), the driver now truncates its committed state to `pos0` instead of letting `acc_len` drift ahead. Before this fix, a ~930-position offset accumulated and acceptance collapsed to ~0% across the resumed conversation.
+
+### Phase E backfill (`e2752a07c`)
+
+The forward-gap counterpart: when the server restored a prefix the driver didn't build (`pos0 > acc_len`), we now backfill the missing KV from the target's own cache. Together with `truncate_to`, this is what lets caching and speculation coexist.
+
+### `post_projection` on-device (`ae8ea24f9`)
+
+The graph used to expose the 1024-wide post-norm hidden; the driver applied `mtp.post_projection` on the host (a 22 MiB weight × 1024 dim matmul per step, ~7 ms host time). Now the graph itself applies `mtp.post_projection` and exposes the backbone-space hidden as the embeddings output (widening `hparams.n_embd_out_impl` to `n_embd_backbone`).
+
+### Lighter `memory_clear` (`ae8ea24f9`)
+
+The draft writes no KV and never reads its own cache — pure cross-attention over the `io` tensors. So `llama_memory_clear(mem, /*data=*/false)` (reset cell metadata only, don't zero the GPU buffers) is sufficient.
+
+### `kv_len_full` bucketing + `can_reuse` override (`1732ad5f3`, `c973d1100`) — the biggest win
+
+The single biggest fixed-overhead optimization. `llm_graph_input_i::can_reuse` returns **false** by default; the custom gemma4_assistant input didn't override it. So the draft graph was rebuilt on every single decode (no CUDA graph either) — ~10 ms/step fixed overhead. Fix: bucket `kv_len_full` to a multiple of 512 and mask the padded positions in the full-layer softmax with `ggml_soft_max_ext` (exact: `exp(-inf)=0` so padding contributes nothing to attention output). With `kv_len_swa` steady at the window after warmup, the graph shape is constant until `acc_len` crosses a 512-bucket boundary — rebuilds every ~365 cycles instead of every step. Implements `can_reuse` to match the bucket. Decode dropped from ~12 ms/step to ~5 ms/step at moderate context.
+
+### GPU argmax + skip logits readback (`d9bbdeeaf`)
+
+Compute `ggml_argmax(logits)` on-device, cast to F32, concat as a +1 tail on the embeddings output (`[hidden | argmax_token]` per token). Set `res->t_logits = nullptr` so the framework skips the 1 MiB host logits readback entirely. The graph still computes logits as an internal node (argmax depends on it); they just never leave the GPU.
+
+### K=1 default
+
+A/B'd against K=2 on the same content: identical `avg_acc` (~0.28), but K=2 doubles `draft()` cost. The second draft step's in-chain acceptance (k1) is ~2%; it never pays for itself at this ceiling.
+
+### Priming step off by default (`df94fdc79`)
+
+Implemented the matched-pair seed (run one extra draft decode from `(last_tok, last_hidden)` to bootstrap `est_hidden@acc_len`, then draft from the real `id_last`) — exactly `spec_run`'s chain shape. A/B showed **identical k0** (~17.5%) with and without priming. The assistant tolerates the off-by-one; the extra step is pure cost. `G4A_PRIME=1` re-enables it as an experiment toggle.
+
+---
+
+## Broader lessons (for other contributors)
+
+Two findings worth surfacing because they generalize beyond this fork:
+
+### Graph reuse is OFF by default in llama.cpp
+
+`llm_graph_input_i::can_reuse` returns `false` by default. If your custom graph input doesn't override it, your graph is rebuilt on *every* decode — including CUDA-graph capture being disabled. For a small model this is a ~10 ms/step fixed cost you won't notice until you measure it. The `llama_perf_context(ctx).n_reused` counter is the diagnostic: if it stays at 0 while you decode many tokens, you're not reusing.
+
+For shapes that change every cycle (like our `kv_len_full = acc_len`), bucket them to a quantum and mask out the padding in the relevant op. `ggml_soft_max_ext` with a `-inf` mask is exact: padded positions contribute 0 to softmax and 0 to the attention output. The mask must have `ne[1] >= n_tokens` (we missed this initially and it crashed at the reserve-time 2-token probe).
+
+### llama-server has three independent restore paths
+
+Any of them can desync your speculative driver's committed length from the target's `pos_next()`:
+
+1. **`--cache-ram <N>`** — cross-request prompt cache.
+2. **`--ctx-checkpoints <N>`** — per-slot SWA-bounded snapshots.
+3. **LCP slot-similarity reuse** — always on; `--slot-prompt-similarity` controls the threshold.
+
+Disabling 1 + 2 doesn't eliminate gaps because 3 is fundamental to how the server schedules work. So a robust draft *must* tolerate restores — either by reading the target's cache to backfill (what Phase E does), or by detecting the gap and pausing drafting until a fresh prompt. The invariant to maintain is `pos0 == acc_len`. The two directions of drift:
+
+- `pos0 < acc_len` → rewind, truncate driver state to `pos0`.
+- `pos0 > acc_len` → forward gap, backfill from the cache.
+- `pos0 == 0` → fresh sequence, reset driver state.
+
+Together these cover every restore the server can do.
+
+## Open items / future work
+
+Items evaluated and not implemented in this fork. See [PLAN.md](PLAN.md) for the current status snapshot.
+
+- **Multi-sequence support.** Substantial — per-seq driver state, multi-stream KV plan, accept-distribution per seq.
+- **`v_trans=true` (no flash-attention) path in the KV cache read primitive.** Would let Phase E work without `-fa`. The transposed-V read needs a per-row gather across embd dims; possible but fiddly for quantized V.
+- **A K>1 draft that pays off.** Would need a draft whose k1 acceptance is materially > 2%. Currently nothing on the menu would lift that.
+- **Update `devtools/gemma4_assistant/{spec_run.cpp, test_decode.cpp}`** to the post-on-device-post_proj, post-GPU-argmax embedding-output shape. They're numerical-validation harnesses that drifted out of sync as the integration matured.
+- **Centroid head support.** The 31B has `use_ordered_embeddings=false` (no centroids). The graph schema and converter assume that; supporting variants with centroids would mean implementing the topk→gather→scatter logits head in `build_arch_graph`.
+
+## Acknowledgments, license, and asking questions
+
+- **License:** inherits from upstream llama.cpp — MIT. Both the NVFP4 emitter and the Gemma 4 Assistant integration are released under the same terms. See `LICENSE` (unchanged from upstream).
+- **Upstream:** this fork tracks [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The remote `upstream` is configured for pulling future updates.
+- **Co-authorship:** much of this work was pair-programmed with Anthropic's Claude (the commit log carries `Co-Authored-By: Claude` trailers on the relevant commits).
+- **Questions / issues / PRs:** please open a GitHub issue. PRs welcome for bug fixes; for design-level changes (multi-seq, non-Gemma-4 backbones), open an issue first to discuss scope.
+- **Status doc:** [PLAN.md](PLAN.md) carries the phase-by-phase ledger and the up-to-date list of done / open items.
+- **Original upstream README:** preserved as [README_ORG.md](README_ORG.md) for reference on the underlying llama.cpp project.
