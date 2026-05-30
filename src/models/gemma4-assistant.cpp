@@ -41,10 +41,11 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_USE_ORDERED_EMBEDDINGS,     hparams.use_ordered_embeddings, false);
     ml.get_key(LLM_KV_ATTENTION_K_EQ_V,           hparams.attn_k_eq_v,            false);
 
-    // The graph applies mtp.post_projection on-device and exposes the backbone-space hidden
-    // (n_embd_backbone-wide) as the embeddings output, so the speculative driver reads it directly
-    // (no host matmul). Widen the embeddings output buffer accordingly.
-    hparams.n_embd_out_impl = hparams.n_embd_backbone;
+    // The graph applies mtp.post_projection AND the argmax over the LM-head logits on-device, and
+    // packs both into the embeddings output: [hidden (n_embd_backbone) | argmax_token (1 f32)] per
+    // token. The driver reads the +1 tail and skips llama_get_logits_ith (no 1 MiB logits readback,
+    // no host argmax). Widen the embeddings output buffer by +1 accordingly.
+    hparams.n_embd_out_impl = hparams.n_embd_backbone + 1;
 
     type = LLM_TYPE_UNKNOWN; // small draft head (e.g. ~470M for the 31B target)
 }
@@ -292,20 +293,26 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
     ggml_tensor * nrm = build_norm(x, m.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(nrm, "result_norm", -1);
 
-    // logits via the tied head (from the post-norm hidden)
+    // logits via the tied head; argmax computed on-device and packed into the embeddings output so
+    // the speculative driver can read just the next-token id (no 1 MiB host logits readback / host
+    // argmax loop). Leave t_logits unset so the framework skips the logits copy entirely.
     ggml_tensor * logits = build_lora_mm(m.output, nrm, m.output_s);
     cb(logits, "result_output", -1);
-    res->t_logits = logits;
+    ggml_tensor * argmax = ggml_argmax(ctx0, logits);                                  // [n_tokens] i32
+    ggml_tensor * argmax_f = ggml_cast(ctx0, argmax, GGML_TYPE_F32);                   // [n_tokens] f32
+    ggml_tensor * argmax_2d = ggml_reshape_2d(ctx0, argmax_f, 1, n_tokens);            // [1, n_tokens]
 
-    // Apply mtp.post_projection on-device and expose the backbone-space hidden (n_embd_backbone-wide)
-    // as the embeddings output -- the speculative driver feeds it straight back as the next step's
-    // hidden, avoiding a ~7 ms/step host matmul over the 22 MiB projection weight.
-    ggml_tensor * post_h = build_lora_mm(m.mtp_post_proj, nrm, m.mtp_post_proj_s); // [n_embd_backbone, n_tokens]
-    cb(post_h, "result_post_proj", -1);
-    res->t_embd = post_h;
+    // Apply mtp.post_projection on-device and concat the argmax as a +1 tail to expose both in one
+    // embeddings readback: [hidden (n_embd_backbone) | argmax (1 f32)] per token. Driver reads back
+    // n_embd_backbone+1 floats (tiny) instead of n_vocab floats (262K = 1 MiB).
+    ggml_tensor * post_h = build_lora_mm(m.mtp_post_proj, nrm, m.mtp_post_proj_s);     // [n_embd_backbone, n_tokens]
+    ggml_tensor * embd_out = ggml_concat(ctx0, post_h, argmax_2d, 0);                  // [n_embd_backbone+1, n_tokens]
+    cb(embd_out, "result_post_proj_argmax", -1);
+    res->t_embd = embd_out;
+    // res->t_logits stays nullptr -> framework skips the logits readback. (The graph still computes
+    // `logits` as an internal node since `argmax` depends on it.)
 
-    ggml_build_forward_expand(gf, logits);
-    ggml_build_forward_expand(gf, post_h);
+    ggml_build_forward_expand(gf, embd_out);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_graph(const llm_graph_params & params) const {

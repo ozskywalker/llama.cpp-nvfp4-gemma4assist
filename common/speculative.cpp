@@ -1170,11 +1170,12 @@ struct common_speculative_impl_draft_gemma4_assistant : public common_speculativ
             llama_batch b = llama_batch_init(1, 0, 1);
             b.n_tokens = 1; b.token[0] = 0; b.pos[0] = acc_len - 1; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
             if (llama_decode(params.ctx_dft, b) != 0) { llama_batch_free(b); return -1; }
-            const float * dl = llama_get_logits_ith(params.ctx_dft, 0);
             const int64_t td1 = ggml_time_us();
-            llama_token dt = 0; for (int v = 1; v < n_vocab; ++v) if (dl[v] > dl[dt]) dt = v;
-            const float * ph = llama_get_embeddings_ith(params.ctx_dft, 0); // backbone hidden (post_proj on-device)
+            // embeddings output is [hidden (n_embd_bb) | argmax_token (1 f32)] -- on-device argmax avoids
+            // the 1 MiB host logits readback and the 262K-vocab host argmax loop.
+            const float * ph = llama_get_embeddings_ith(params.ctx_dft, 0);
             h_out.assign(ph, ph + n_embd_bb);
+            const llama_token dt = (llama_token) ph[n_embd_bb]; // f32 -> i32, lossless for vocab << 2^24
             const int64_t td2 = ggml_time_us();
             t_decode_us += td1 - td0; t_post_us += td2 - td1; n_draft_steps++;
             llama_batch_free(b);
