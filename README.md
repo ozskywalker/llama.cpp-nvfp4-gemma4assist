@@ -1,599 +1,359 @@
-# llama.cpp
+# FINDINGS
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+A self-contained writeup of two pieces of work added to this fork of llama.cpp:
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+1. **NVFP4 quantization** — an `llama-quantize` output emitter for NVIDIA's two-level FP4 format, so target models can be losslessly serialized to NVFP4 GGUF for inference on Blackwell.
+2. **`Gemma4AssistantForCausalLM` speculative draft** — a full integration of Google's Gemma 4 Assistant draft head: HF → GGUF conversion, a new C++ architecture (`LLM_ARCH_GEMMA4_ASSISTANT`), a custom speculative driver, and the optimization work that makes it actually accelerate a Gemma 4 31B backbone in `llama-server`.
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+The two pieces are independent but designed to coexist: the target (Gemma 4 31B) is NVFP4-quantized so it fits in 32 GiB of VRAM at 128K context, and the draft (the assistant head, ~470M, kept in f16) runs alongside it on the same GPU.
 
-LLM inference in C/C++
+---
 
-## Recent API changes
+## TL;DR
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+- `llama-quantize <fp16>.gguf <out>.gguf NVFP4` now works (and `NVFP4_MOE` for MoE experts-only).
+- `--spec-type draft-gemma4-assistant` runs the assistant draft against a Gemma 4 31B target in `llama-server`.
+- Measured on RTX PRO 4500 Blackwell (32 GiB), Gemma 4 31B NVFP4 target + f16 assistant draft, 128K context:
+  - **~22–25 tok/s generation at ~30K context** with speculation on (K=1).
+  - **~28% per-draft acceptance** (this is the NVFP4-target ceiling — see §6).
+  - **Caching + speculation coexist** (Phase E backfill).
+  - Memory: ~27 GiB total (target 16.8 + draft KV ~1 + draft model ~0.9 + draft compute + slot caches).
 
-## Hot topics
+---
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-- WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
+## 1. Background
 
-----
+### Why a "draft" model at all
 
-## Quick start
+Speculative decoding accelerates generation by having a small, fast *draft* model propose the next K tokens, which the target then verifies in a single batched forward. Accepted drafts are emitted as if the target had decoded them; rejected ones are discarded. Output is *lossless* — bit-identical to running the target alone.
 
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
+### What `Gemma4AssistantForCausalLM` actually is
 
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+This is a critical point that reshaped the whole integration. The HF arch name suggests a model. It is not. Inspecting `transformers/models/gemma4_assistant/modeling_gemma4_assistant.py` shows:
 
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
+- `forward()` **ignores `input_ids`** and *requires* `inputs_embeds` (backbone hidden states) plus `shared_kv_states` (the backbone's K/V from its last full-attention and last sliding-attention layers).
+- The draft has **no `k_proj` / `v_proj` / `k_norm`** — only `attn_q` + `attn_q_norm`. It cannot compute its own K/V; it *must* cross-attend over the backbone's K/V.
+- It runs a dense Gemma 4 text stack (4 layers, hidden 1024) with a `pre_projection` (`2·backbone_hidden → hidden`) on input and a `post_projection` (`hidden → backbone_hidden`) on output, fed by an autoregressive chain at a *fixed RoPE position* (NVIDIA / HF's `SinglePositionMultiTokenCandidateGenerator`).
 
-Example command:
+So the assistant is a **draft head bolted to a specific backbone arch (Gemma 4)**. It cannot produce text on its own. Wiring it into llama.cpp's pluggable speculative framework required novel machinery that none of the existing draft types (`draft-simple`, `draft-eagle3`, `draft-mtp`) handled:
 
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
+- Capture the backbone's K/V from a running target context and pipe it into a separate draft context.
+- Feed the target's last hidden state into the draft as an input embedding.
+- Drive an autoregressive chain at a fixed position rather than incrementing RoPE.
 
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+### Why NVFP4
 
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
-```
+NVFP4 is NVIDIA's 4-bit floating-point quantization format with **two-level scaling**:
+- Per-block (block size 16) UE4M3 scale.
+- Per-tensor FP32 `weight_scale_2 = amax / (6·448)` (a companion `.scale` tensor next to each weight).
 
-## Description
+llama.cpp already had the inference-side `GGML_TYPE_NVFP4` (load + matmul) before this fork, but `llama-quantize` had no NVFP4 *output* path, so producing NVFP4 GGUFs required converting from a third-party tool. We needed to quantize the Gemma 4 31B target ourselves (the assistant head is too quirky to ship pre-quantized — only the target is). At 31B parameters and ~4.64 bpw, NVFP4 is what lets the 31B + KV cache + draft fit in a 32 GiB GPU at 128K context.
 
-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
-range of hardware - locally and in the cloud.
+---
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## 2. What was added to llama.cpp
 
-The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
+### 2.1 NVFP4 quantize emitter (commit `35018cc2d`)
 
-<details>
-<summary>Models</summary>
+`include/llama.h`, `src/llama-model-loader.cpp`, `src/llama-quant.cpp`, `tools/quantize/quantize.cpp`.
 
-Typically finetunes of the base models below are supported as well.
+- Two new ftypes: `LLAMA_FTYPE_MOSTLY_NVFP4` (all eligible 2D weights → NVFP4) and `LLAMA_FTYPE_MOSTLY_NVFP4_MOE` (experts only).
+- **Tensor selection policy:** 2D weights with row width % 64 → NVFP4; `token_embd` and `output` fall back to **Q8_0** (they have no `weight_scale_2` path in the inference kernels).
+- **Two-level scale generation:** the block scales are computed on data *pre-divided* by `weight_scale_2`, and the companion `.scale` tensor (FP32, shape `[n_experts]` for MoE or `[1]` for plain) is written *interleaved after each weight* so GGUF offsets and the streamed writes stay in lockstep.
 
-Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
-
-#### Text-only
-
-- [X] LLaMA 🦙
-- [x] LLaMA 2 🦙🦙
-- [x] LLaMA 3 🦙🦙🦙
-- [X] [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [x] [Mixtral MoE](https://huggingface.co/models?search=mistral-ai/Mixtral)
-- [x] [DBRX](https://huggingface.co/databricks/dbrx-instruct)
-- [x] [Jamba](https://huggingface.co/ai21labs)
-- [X] [Falcon](https://huggingface.co/models?search=tiiuae/falcon)
-- [X] [Chinese LLaMA / Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca) and [Chinese LLaMA-2 / Alpaca-2](https://github.com/ymcui/Chinese-LLaMA-Alpaca-2)
-- [X] [Vigogne (French)](https://github.com/bofenghuang/vigogne)
-- [X] [BERT](https://github.com/ggml-org/llama.cpp/pull/5423)
-- [X] [Koala](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-- [X] [Baichuan 1 & 2](https://huggingface.co/models?search=baichuan-inc/Baichuan) + [derivations](https://huggingface.co/hiyouga/baichuan-7b-sft)
-- [X] [Aquila 1 & 2](https://huggingface.co/models?search=BAAI/Aquila)
-- [X] [Starcoder models](https://github.com/ggml-org/llama.cpp/pull/3187)
-- [X] [Refact](https://huggingface.co/smallcloudai/Refact-1_6B-fim)
-- [X] [MPT](https://github.com/ggml-org/llama.cpp/pull/3417)
-- [X] [Bloom](https://github.com/ggml-org/llama.cpp/pull/3553)
-- [x] [Yi models](https://huggingface.co/models?search=01-ai/Yi)
-- [X] [StableLM models](https://huggingface.co/stabilityai)
-- [x] [Deepseek models](https://huggingface.co/models?search=deepseek-ai/deepseek)
-- [x] [Qwen models](https://huggingface.co/models?search=Qwen/Qwen)
-- [x] [PLaMo-13B](https://github.com/ggml-org/llama.cpp/pull/3557)
-- [x] [Phi models](https://huggingface.co/models?search=microsoft/phi)
-- [x] [PhiMoE](https://github.com/ggml-org/llama.cpp/pull/11003)
-- [x] [GPT-2](https://huggingface.co/gpt2)
-- [x] [Orion 14B](https://github.com/ggml-org/llama.cpp/pull/5118)
-- [x] [InternLM2](https://huggingface.co/models?search=internlm2)
-- [x] [CodeShell](https://github.com/WisdomShell/codeshell)
-- [x] [Gemma](https://ai.google.dev/gemma)
-- [x] [Mamba](https://github.com/state-spaces/mamba)
-- [x] [Grok-1](https://huggingface.co/keyfan/grok-1-hf)
-- [x] [Xverse](https://huggingface.co/models?search=xverse)
-- [x] [Command-R models](https://huggingface.co/models?search=CohereForAI/c4ai-command-r)
-- [x] [SEA-LION](https://huggingface.co/models?search=sea-lion)
-- [x] [GritLM-7B](https://huggingface.co/GritLM/GritLM-7B) + [GritLM-8x7B](https://huggingface.co/GritLM/GritLM-8x7B)
-- [x] [OLMo](https://allenai.org/olmo)
-- [x] [OLMo 2](https://allenai.org/olmo)
-- [x] [OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924)
-- [x] [Granite models](https://huggingface.co/collections/ibm-granite/granite-code-models-6624c5cec322e4c148c8b330)
-- [x] [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) + [Pythia](https://github.com/EleutherAI/pythia)
-- [x] [Snowflake-Arctic MoE](https://huggingface.co/collections/Snowflake/arctic-66290090abe542894a5ac520)
-- [x] [Smaug](https://huggingface.co/models?search=Smaug)
-- [x] [Poro 34B](https://huggingface.co/LumiOpen/Poro-34B)
-- [x] [Bitnet b1.58 models](https://huggingface.co/1bitLLM)
-- [x] [Flan T5](https://huggingface.co/models?search=flan-t5)
-- [x] [Open Elm models](https://huggingface.co/collections/apple/openelm-instruct-models-6619ad295d7ae9f868b759ca)
-- [x] [ChatGLM3-6b](https://huggingface.co/THUDM/chatglm3-6b) + [ChatGLM4-9b](https://huggingface.co/THUDM/glm-4-9b) + [GLMEdge-1.5b](https://huggingface.co/THUDM/glm-edge-1.5b-chat) + [GLMEdge-4b](https://huggingface.co/THUDM/glm-edge-4b-chat)
-- [x] [GLM-4-0414](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e)
-- [x] [SmolLM](https://huggingface.co/collections/HuggingFaceTB/smollm-6695016cad7167254ce15966)
-- [x] [EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)
-- [x] [FalconMamba Models](https://huggingface.co/collections/tiiuae/falconmamba-7b-66b9a580324dd1598b0f6d4a)
-- [x] [Jais](https://huggingface.co/inceptionai/jais-13b-chat)
-- [x] [Bielik-11B-v2.3](https://huggingface.co/collections/speakleash/bielik-11b-v23-66ee813238d9b526a072408a)
-- [x] [RWKV-7](https://huggingface.co/collections/shoumenchougou/rwkv7-gxx-gguf)
-- [x] [RWKV-6](https://github.com/BlinkDL/RWKV-LM)
-- [x] [QRWKV-6](https://huggingface.co/recursal/QRWKV6-32B-Instruct-Preview-v0.1)
-- [x] [GigaChat-20B-A3B](https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct)
-- [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
-- [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
-- [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
-- [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
-
-#### Multimodal
-
-- [x] [LLaVA 1.5 models](https://huggingface.co/collections/liuhaotian/llava-15-653aac15d994e992e2677a7e), [LLaVA 1.6 models](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2)
-- [x] [BakLLaVA](https://huggingface.co/models?search=SkunkworksAI/Bakllava)
-- [x] [Obsidian](https://huggingface.co/NousResearch/Obsidian-3B-V0.5)
-- [x] [ShareGPT4V](https://huggingface.co/models?search=Lin-Chen/ShareGPT4V)
-- [x] [MobileVLM 1.7B/3B models](https://huggingface.co/models?search=mobileVLM)
-- [x] [Yi-VL](https://huggingface.co/models?search=Yi-VL)
-- [x] [Mini CPM](https://huggingface.co/models?search=MiniCPM)
-- [x] [Moondream](https://huggingface.co/vikhyatk/moondream2)
-- [x] [Bunny](https://github.com/BAAI-DCAI/Bunny)
-- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
-- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
-- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
-
-</details>
-
-<details>
-<summary>Bindings</summary>
-
-- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
-- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
-- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
-- Node.js: [withcatai/node-llama-cpp](https://github.com/withcatai/node-llama-cpp)
-- JS/TS (llama.cpp server client): [lgrammel/modelfusion](https://modelfusion.dev/integration/model-provider/llamacpp)
-- JS/TS (Programmable Prompt Engine CLI): [offline-ai/cli](https://github.com/offline-ai/cli)
-- JavaScript/Wasm (works in browser): [tangledgroup/llama-cpp-wasm](https://github.com/tangledgroup/llama-cpp-wasm)
-- Typescript/Wasm (nicer API, available on npm): [ngxson/wllama](https://github.com/ngxson/wllama)
-- Ruby: [yoshoku/llama_cpp.rb](https://github.com/yoshoku/llama_cpp.rb)
-- Ruby: [docusealco/rllama](https://github.com/docusealco/rllama)
-- Rust (more features): [edgenai/llama_cpp-rs](https://github.com/edgenai/llama_cpp-rs)
-- Rust (nicer API): [mdrokz/rust-llama.cpp](https://github.com/mdrokz/rust-llama.cpp)
-- Rust (more direct bindings): [utilityai/llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs)
-- Rust (automated build from crates.io): [ShelbyJenkins/llm_client](https://github.com/ShelbyJenkins/llm_client)
-- C#/.NET: [SciSharp/LLamaSharp](https://github.com/SciSharp/LLamaSharp)
-- C#/VB.NET (more features - community license): [LM-Kit.NET](https://docs.lm-kit.com/lm-kit-net/index.html)
-- Scala 3: [donderom/llm4s](https://github.com/donderom/llm4s)
-- Clojure: [phronmophobic/llama.clj](https://github.com/phronmophobic/llama.clj)
-- React Native: [mybigday/llama.rn](https://github.com/mybigday/llama.rn)
-- Java: [kherud/java-llama.cpp](https://github.com/kherud/java-llama.cpp)
-- Java: [QuasarByte/llama-cpp-jna](https://github.com/QuasarByte/llama-cpp-jna)
-- Zig: [deins/llama.cpp.zig](https://github.com/Deins/llama.cpp.zig)
-- Flutter/Dart: [netdur/llama_cpp_dart](https://github.com/netdur/llama_cpp_dart)
-- Flutter: [xuegao-tzx/Fllama](https://github.com/xuegao-tzx/Fllama)
-- PHP (API bindings and features built on top of llama.cpp): [distantmagic/resonance](https://github.com/distantmagic/resonance) [(more info)](https://github.com/ggml-org/llama.cpp/pull/6326)
-- Guile Scheme: [guile_llama_cpp](https://savannah.nongnu.org/projects/guile-llama-cpp)
-- Swift [srgtuszy/llama-cpp-swift](https://github.com/srgtuszy/llama-cpp-swift)
-- Swift [ShenghaiWang/SwiftLlama](https://github.com/ShenghaiWang/SwiftLlama)
-- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
-- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
-- Android: [llama.android](/examples/llama.android)
-
-</details>
-
-<details>
-<summary>UIs</summary>
-
-*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
-
-- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
-- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
-- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
-- [Dot](https://github.com/alexpinel/Dot) (GPL)
-- [eva](https://github.com/ylsdamxssjxxdd/eva) (MIT)
-- [iohub/collama](https://github.com/iohub/coLLaMA) (Apache-2.0)
-- [janhq/jan](https://github.com/janhq/jan) (AGPL)
-- [johnbean393/Sidekick](https://github.com/johnbean393/Sidekick) (MIT)
-- [KanTV](https://github.com/zhouwg/kantv?tab=readme-ov-file) (Apache-2.0)
-- [KodiBot](https://github.com/firatkiral/kodibot) (GPL)
-- [llama.vim](https://github.com/ggml-org/llama.vim) (MIT)
-- [LARS](https://github.com/abgulati/LARS) (AGPL)
-- [Llama Assistant](https://github.com/vietanhdev/llama-assistant) (GPL)
-- [LlamaLib](https://github.com/undreamai/LlamaLib) (Apache-2.0)
-- [LLMFarm](https://github.com/guinmoon/LLMFarm?tab=readme-ov-file) (MIT)
-- [LLMUnity](https://github.com/undreamai/LLMUnity) (MIT)
-- [LMStudio](https://lmstudio.ai/) (proprietary)
-- [LocalAI](https://github.com/mudler/LocalAI) (MIT)
-- [LostRuins/koboldcpp](https://github.com/LostRuins/koboldcpp) (AGPL)
-- [MindMac](https://mindmac.app) (proprietary)
-- [MindWorkAI/AI-Studio](https://github.com/MindWorkAI/AI-Studio) (FSL-1.1-MIT)
-- [Mobile-Artificial-Intelligence/maid](https://github.com/Mobile-Artificial-Intelligence/maid) (MIT)
-- [Mozilla-Ocho/llamafile](https://github.com/Mozilla-Ocho/llamafile) (Apache-2.0)
-- [nat/openplayground](https://github.com/nat/openplayground) (MIT)
-- [nomic-ai/gpt4all](https://github.com/nomic-ai/gpt4all) (MIT)
-- [ollama/ollama](https://github.com/ollama/ollama) (MIT)
-- [oobabooga/text-generation-webui](https://github.com/oobabooga/text-generation-webui) (AGPL)
-- [PocketPal AI](https://github.com/a-ghorbani/pocketpal-ai) (MIT)
-- [psugihara/FreeChat](https://github.com/psugihara/FreeChat) (MIT)
-- [ptsochantaris/emeltal](https://github.com/ptsochantaris/emeltal) (MIT)
-- [pythops/tenere](https://github.com/pythops/tenere) (AGPL)
-- [ramalama](https://github.com/containers/ramalama) (MIT)
-- [semperai/amica](https://github.com/semperai/amica) (MIT)
-- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
-- [Autopen](https://github.com/blackhole89/autopen) (GPL)
-
-</details>
-
-<details>
-<summary>Tools</summary>
-
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
-- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
-- [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
-- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
-- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
-- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
-
-</details>
-
-<details>
-<summary>Infrastructure</summary>
-
-- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
-- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
-- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
-- [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
-- [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
-- [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
-- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
-  support"
-</details>
-
-<details>
-<summary>Games</summary>
-
-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
-
-</details>
-
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-
-## Obtaining and quantizing models
-
-The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
-
-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
-
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
-
-```sh
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
-
-After downloading a model, use the CLI tools to run it locally - see below.
-
-`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
-
-The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
-
-- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
-
-To learn more about model quantization, [read this documentation](tools/quantize/README.md)
-
-## [`llama-cli`](tools/cli)
-
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
-
-- <details open>
-    <summary>Run in conversation mode</summary>
-
-    Models with a built-in chat template will automatically activate conversation mode. If this doesn't occur, you can manually enable it by adding `-cnv` and specifying a suitable chat template with `--chat-template NAME`
-
-    ```bash
-    llama-cli -m model.gguf
-
-    # > hi, who are you?
-    # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
-    #
-    # > what is 1+1?
-    # Easy peasy! The answer to 1+1 is... 2!
-    ```
-
-    </details>
-
-- <details>
-    <summary>Run in conversation mode with custom chat template</summary>
-
-    ```bash
-    # use the "chatml" template (use -h to see the list of supported templates)
-    llama-cli -m model.gguf -cnv --chat-template chatml
-
-    # use a custom template
-    llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain the output with a custom grammar</summary>
-
-    ```bash
-    llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
-
-    # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
-    ```
-
-    The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
-
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
-
-    </details>
-
-
-## [`llama-server`](tools/server)
-
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
-
-- <details open>
-    <summary>Start a local HTTP server with default configuration on port 8080</summary>
-
-    ```bash
-    llama-server -m model.gguf --port 8080
-
-    # Basic web UI can be accessed via browser: http://localhost:8080
-    # Chat completion endpoint: http://localhost:8080/v1/chat/completions
-    ```
-
-    </details>
-
-- <details>
-    <summary>Support multiple-users and parallel decoding</summary>
-
-    ```bash
-    # up to 4 concurrent requests, each with 4096 max context
-    llama-server -m model.gguf -c 16384 -np 4
-    ```
-
-    </details>
-
-- <details>
-    <summary>Enable speculative decoding</summary>
-
-    ```bash
-    # the draft.gguf model should be a small variant of the target model.gguf
-    llama-server -m model.gguf -md draft.gguf
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve an embedding model</summary>
-
-    ```bash
-    # use the /embedding endpoint
-    llama-server -m model.gguf --embedding --pooling cls -ub 8192
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve a reranking model</summary>
-
-    ```bash
-    # use the /reranking endpoint
-    llama-server -m model.gguf --reranking
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain all outputs with a grammar</summary>
-
-    ```bash
-    # custom grammar
-    llama-server -m model.gguf --grammar-file grammar.gbnf
-
-    # JSON
-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
-    ```
-
-    </details>
-
-
-## [`llama-perplexity`](tools/perplexity)
-
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
-
-- <details open>
-    <summary>Measure the perplexity over a text file</summary>
-
-    ```bash
-    llama-perplexity -m model.gguf -f file.txt
-
-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
-    # Final estimate: PPL = 5.4007 +/- 0.67339
-    ```
-
-    </details>
-
-- <details>
-    <summary>Measure KL divergence</summary>
-
-    ```bash
-    # TODO
-    ```
-
-    </details>
-
-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
-
-## [`llama-bench`](tools/llama-bench)
-
-#### Benchmark the performance of the inference for various parameters.
-
-- <details open>
-    <summary>Run default benchmark</summary>
-
-    ```bash
-    llama-bench -m model.gguf
-
-    # Output:
-    # | model               |       size |     params | backend    | threads |          test |                  t/s |
-    # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         pp512 |      5765.41 ± 20.55 |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
-    #
-    # build: 3e0ba0e60 (4229)
-    ```
-
-    </details>
-
-## [`llama-simple`](examples/simple)
-
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
-
-- <details>
-    <summary>Basic text completion</summary>
-
-    ```bash
-    llama-simple -m model.gguf
-
-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
-    ```
-
-    </details>
-
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
-- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
-
-## Other documentation
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development documentation
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-
-#### Seminal papers and background on the models
-
-If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
-- LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
-- GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
-- GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
-
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
-import PackageDescription
-
-let package = Package(
-    name: "MyLlamaPackage",
-    targets: [
-        .executableTarget(
-            name: "MyLlamaPackage",
-            dependencies: [
-                "LlamaFramework"
-            ]),
-        .binaryTarget(
-            name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
-        )
-    ]
-)
-```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
-
-## Completions
-Command-line completion is available for some environments.
-
-#### Bash Completion
+Usage:
 ```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+llama-quantize <in>.f16.gguf <out>.nvfp4.gguf NVFP4
+llama-quantize <in>.f16.gguf <out>.nvfp4_moe.gguf NVFP4_MOE  # MoE experts only
 ```
 
-## Dependencies
+The 31B Gemma 4 target compresses from ~62 GiB (f16) to ~16.8 GiB (NVFP4) — a 3.7× shrink — and the resulting GGUF runs natively on Blackwell (no CPU dequant fallback) via the existing FP4 kernels.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+### 2.2 `Gemma4AssistantForCausalLM` integration
+
+A multi-phase integration. Files touched (representative):
+
+- **Conversion** (`conversion/gemma.py`, `conversion/__init__.py`):
+  `Gemma4AssistantModel(Gemma4Model)` emits the dense Gemma-4 backbone + the `mtp.{pre,post}_projection` weights + assistant-specific metadata keys (`backbone_hidden_size`, `requires_target_arch=gemma4`, etc.).
+- **GGUF schema** (`gguf-py/gguf/{constants,gguf_writer,tensor_mapping}.py`):
+  `MODEL_ARCH.GEMMA4_ASSISTANT`, new `MTP_*` tensor enums, new KV keys.
+- **C++ architecture** (`src/llama-arch.{h,cpp}`, `src/llama-hparams.h`, `src/models/models.h`, `src/models/gemma4-assistant.cpp`):
+  `LLM_ARCH_GEMMA4_ASSISTANT`, `load_arch_hparams`, `load_arch_tensors`, and a custom `build_arch_graph` that does the cross-attention over external K/V tensors (no `build_attn` / no own KV cache).
+- **Staging API** (`src/llama-ext.h`):
+  `llama_gemma4_assistant_io` (the I/O the driver attaches), `llama_set_eval_callback` (installs the K/V-capture callback on the target), `llama_context_dev_buft` (so the driver can allocate device tensors the draft graph views), `llama_kv_read_layer_f32` (the Phase E backfill primitive).
+- **Speculative driver** (`common/common.h`, `common/speculative.cpp`):
+  `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT`, the impl struct, the lifecycle (`begin` / `process` / `draft` / `accept`).
+- **Server wiring** (`tools/server/server-context.cpp`):
+  `--spec-type draft-gemma4-assistant`, draft context parameters (`n_batch=8`, `n_ubatch=1`), `model_path_tgt` threaded through, draft-simple auto-enable suppressed.
+
+### 2.3 Performance work on the speculative path
+
+A series of independent optimizations, each measurable, layered on top of the working integration. These are described in §5.
+
+### 2.4 Verification harnesses (`devtools/gemma4_assistant/`)
+
+`dump_hf_reference.py`, `numpy_reference.py`, `replay.cpp`, `test_decode.cpp`, `probe_kv.cpp`, `spec_run.cpp` — used during development to gate each layer of the integration against the HF reference (numpy ≤ 1e-6, ggml ≤ 1e-3, end-to-end argmax match). Some of these are now out of sync with the final embedding output shape; useful as historical reference + a starting point for re-validating future changes.
+
+---
+
+## 3. Results
+
+All numbers from RTX PRO 4500 Blackwell (32 GiB), CUDA + Blackwell native FP4 kernels, single sequence (`--parallel 1`).
+
+| Metric | Value |
+|---|---|
+| Target: Gemma 4 31B NVFP4 | 16.8 GiB on GPU |
+| Draft: gemma 4 31B assistant f16 | ~0.9 GiB on GPU + ~1 GiB device-resident shared KV |
+| Context | 131072 tokens (128K) |
+| Generation throughput at ~30K context, K=1 | **22–25 tok/s** |
+| Prompt processing | ~500–800 tok/s (cache-dependent) |
+| Per-draft acceptance (k0) | ~26–28% |
+| Avg accepted drafts/cycle | ~0.28 (so ~1.28 tokens/cycle) |
+| Draft step cost (1 step, 30K ctx) | ~10 ms |
+| Steady-state host RSS | ~27 GiB (target + draft model + slot prompt cache) |
+
+**Net gain over target-alone:** with all optimizations on and caching enabled, speculation is **net-positive** at long context (≈+10–20% tg). The exact gain is content-dependent; at ~28% acceptance, you get ~1.28 tokens for the price of one target verify + one draft decode (~50 ms vs ~40 ms target-alone single decode at 30K).
+
+**What does NOT pay off (measured):**
+- K=2 vs K=1: doubles `draft()` cost; second-draft acceptance (k1) is only ~2%. K=1 wins on tg.
+- Priming step to fix the `id_last/last_hidden` off-by-one: zero acceptance gain in A/B (the assistant tolerates the mismatched pair). Default off.
+
+---
+
+## 4. The integration, phase by phase
+
+Reproducing the order in which things were built and validated:
+
+### Phase A — HF → GGUF f16 conversion
+
+`Gemma4AssistantModel(Gemma4Model)` in `conversion/gemma.py`. Emits the dense Gemma 4 backbone tensors + the `mtp.pre_projection` / `mtp.post_projection` projections + the assistant metadata. The output is **bit-for-bit identical** to a reference GGUF (49/49 tensors match by hash).
+
+### Phase B — C++ load path
+
+`LLM_ARCH_GEMMA4_ASSISTANT` factory case, hparams + tensors loaded (49/49 consumed), `build_arch_graph` initially a throwing stub (load+quantize are graph-free).
+
+### Phase C — Inference graph + speculative driver
+
+**The hard part.** Three subphases:
+
+**C1 — Forward, numerically verified.** Built `numpy_reference.py` and `replay.cpp` against a synthetic-but-fixed input + HF oracle (`dump_hf_reference.py`). The numpy reimpl matches HF to rel ~1e-6 at every layer; the ggml replay matches to rel ~1e-3 (f16-vs-f32 noise; argmax matches). Lots of small wins encoded here:
+- RMS norms are **w-only** (NOT 1+w like Gemma 3).
+- Attention scale is **1.0** (not 1/√d).
+- **`layer_scalar` multiplies the residual at the *end* of each layer** (was the key bug — a missing factor that broke everything).
+- Full layers use **proportional RoPE** (NEOX, theta 1e6, `freq_factors = [1]*nrot + [1e30]*(hd/2-nrot)`, `nrot = hd*0.25/2`).
+- SWA layers use a 1e4-theta full-head-dim rotation.
+- K is post-RoPE, V is normed-but-not-roped, both consumed as-is from the backbone.
+
+**C2 — Driver design.** The HF reference's data flow:
+```
+last_token_embedding = TARGET_embed(last_token_id)                # (5376,)
+inputs_embeds        = concat(last_token_embedding, last_hidden)  # (10752,) = 2*backbone
+draft.forward(inputs_embeds, shared_kv_states)
+  → next token id, next hidden  (then loop)
+```
+The driver needs from the target, per cycle: (a) the shared K/V from layers `L_full=59` and `L_swa=58`, (b) the backbone's final hidden state of the last validated token, (c) the embedding table row for each drafted token. The `cb_eval` callback path is how (a) and (b) are extracted. The driver writes the wide concat into `io.embd` and attaches all external K/V via `llama_gemma4_assistant_set_io`.
+
+**C3 — End-to-end on `llama-server`.** `COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT` wired into the framework; the server creates `ctx_tgt` with the K/V capture callback; lossless generation verified vs target-only.
+
+### Phase D — NVFP4 quantization
+
+Already covered in §2.1. Independent of the assistant work, but indispensable for fitting 31B + 128K KV in 32 GiB.
+
+### Phase E — KV-cache backfill (caching + speculation coexistence)
+
+`llama-server`'s prompt-cache, context-checkpoint, and **LCP slot-similarity** reuse load prefix KV into the target's cache *without re-decoding* — so `cb_eval` never fires for those positions and the driver's `acc_len` falls behind `pos0`. Misaligned KV → garbage drafts → ~0% acceptance.
+
+Phase E adds a primitive — `llama_kv_read_layer_f32(ctx, il, seq, p0, p1, k_out, v_out)` — that reads the stored post-RoPE K and normed V for a position range out of the target's own KV cache (handling the iSWA base-vs-sliding routing, the `map_layer_ids` remap, dequantization, and contiguous-run batching). When `pos0 > acc_len` the driver calls it for layers 59 and 58 over the gap, commits the result, and drafting resumes aligned. **Requires the target to run with flash-attention** (so V is non-transposed and readable as contiguous rows).
+
+The premise that justifies this: `build_attn` stores into the cache *exactly* the tensors `cb_eval` captures (`Kcur_pos`, `Vcur_normed` — verified by inspection of `src/models/gemma4.cpp:226-239`). So the cache *is* the right source.
+
+---
+
+## 5. Performance optimizations
+
+Each of these landed independently and was measured against the previous baseline:
+
+1. **Device-resident full-layer KV** — store the full-layer shared K/V in a persistent device tensor (`dev_k_full`/`dev_v_full`, allocated once via `llama_context_dev_buft`) that the draft graph *views* with `ggml_view_3d`. Replaces a ~0.5–1 GiB host→device copy *per draft step* at 128K. Big PCIe-bound win at long context.
+
+2. **SWA host accumulation windowing** — the sliding-attention layers only ever read the last `sliding_window` (1024) positions, so the host buffer is trimmed in `commit()` to that window. Bounds host memory at ~8 MiB instead of growing to ~1–2 GiB at 128K.
+
+3. **F16 KV inputs** — halve the on-GPU input size for the host-fallback KV path (the device path uses the device F16 storage natively).
+
+4. **`cap_*` → `vbuf_*` lifecycle fix** (the OOM-killer). Originally `cap_*` (the per-decode `cb_eval` capture) was only cleared on the seed decode and in `accept()`. Re-prefills and the server's checkpoint-restore path bypassed both → `cap_*` accumulated across decodes into tens of GiB and the kernel OOM-killed the server. Fixed: `process()` *always* consumes and clears `cap_*` in the same call, handing the verify capture to `accept()` through a small saved buffer (`vbuf_*`, one verify batch ≈ K+1 positions). Leak-proof regardless of whether `accept()` runs.
+
+5. **Position-aligned commits + `truncate_to`** — the verify batch sets `pos0 = pos_next() = #confirmed tokens`, so the invariant is `pos0 == acc_len`. When the server reuses a prefix and starts at `pos0 < acc_len` (LCP slot reuse), the driver now truncates its committed state to `pos0` instead of letting `acc_len` drift ahead (which was producing a ~930-position offset and collapsing acceptance to ~0%).
+
+6. **Phase E backfill** — see §4 above. Closes the `pos0 > acc_len` direction (caching restores).
+
+7. **`post_projection` on-device** — apply `mtp.post_projection` in the draft graph itself and expose the backbone-space hidden as the embeddings output (widen `hparams.n_embd_out_impl` to `n_embd_backbone`). Eliminates a ~7 ms/step host matmul over the 22 MiB projection weight.
+
+8. **Lighter `memory_clear`** — the draft writes no KV and never reads its own cache, so `llama_memory_clear(mem, /*data=*/false)` (reset metadata only, don't zero the GPU buffers) is sufficient. Cheap win per step.
+
+9. **`kv_len_full` bucketing + `can_reuse` override → draft graph reuse + CUDA graphs.** The single biggest fixed-overhead win. `llm_graph_input_i::can_reuse` defaults to **false**, so the custom gemma4_assistant input never opted into reuse → the draft graph was rebuilt on *every single decode* (no CUDA graph either). Fix: bucket `kv_len_full` to a multiple of 512 and mask the padded positions in the full-layer softmax with `ggml_soft_max_ext` (exact: `exp(-inf)=0`). With `kv_len_swa` steady at the window after warmup, the graph shape is now constant until `acc_len` crosses a 512-bucket boundary — rebuilds every ~365 cycles instead of every step. Implements `can_reuse` to match the bucket. Decode dropped from ~12 ms/step to ~5 ms/step at moderate context.
+
+10. **GPU argmax + skip the draft logits readback** — compute `ggml_argmax(logits)` on-device, cast to F32, concat as a +1 tail on the embeddings output (`[hidden | argmax_token]` per token). Set `res->t_logits = nullptr` so the framework skips the **1 MiB host logits readback** entirely. The graph still computes logits as an internal node (because argmax depends on it); they just never leave the GPU. Driver reads the +1 tail and casts F32→`llama_token` (lossless for vocab ≪ 2²⁴). Eliminates the readback + the 262K-vocab host argmax loop.
+
+11. **K=1 default (recommended via `--spec-draft-n-max 1`).** A/B'd against K=2 on the same content: identical `avg_acc` (~0.28), but K=2 doubles `draft()` cost — net tg loss. The second draft step's in-chain acceptance (k1) is ~2%; it never pays for itself at this acceptance ceiling.
+
+12. **Priming step (off by default).** Implemented the matched-pair seed (`step(last_tok, last_hidden)` to bootstrap `est_hidden@acc_len`, then draft from the real `id_last`) — exactly spec_run's chain. A/B showed **identical k0** (~17.5%) with and without priming. The assistant tolerates the off-by-one; the extra step is pure cost. `G4A_PRIME=1` re-enables it as an experiment toggle.
+
+---
+
+## 6. The acceptance ceiling
+
+This is the single most important empirical result for understanding why speculation here is *net-positive but bounded*.
+
+**The realistic per-draft acceptance is ~25–30%** — meaning at K=1 you get an average of ~1.28 tokens per target-decode cycle. The headline number that floated around development was **32% k=0 raw match** from `spec_run` at *very short context*, which is `argmax(draft)==argmax(target)` regardless of chain state. End-to-end (in-chain) acceptance — which is what actually matters — is materially lower: ~15.8% in `spec_run`'s K=2 run at short context, ~28% at long context in production.
+
+**Why this is the ceiling, not a bug we should chase further:** the draft was trained against the *full-precision* backbone. We run it against an **NVFP4-quantized** backbone whose attention and matmul outputs differ from the full-precision targets the draft expects, in a way the draft can't compensate for. The acceptance budget is paid by that quantization mismatch.
+
+What we proved by ablation:
+- **Off-by-one (token, hidden) pairing is not the bottleneck.** Priming gave 0% lift.
+- **The KV transport (device-view vs host-copy) is not the bottleneck.** A/B gave 1.4% vs 3% — within noise, mostly content-dependent.
+- **Bucketing/reuse and GPU argmax don't change acceptance** (math is exact).
+- **K>1 doesn't help acceptance.** k1 ≈ 2%, k2 ≈ 0%.
+
+What *would* lift it (and isn't pursued in this fork): running a higher-precision target. Q8_0 31B is ~33 GiB and doesn't fit; f16 is ~62 GiB. NVFP4 is the only way to fit 31B in 32 GiB at 128K, and that's the trade-off.
+
+---
+
+## 7. How to use it
+
+Assumptions: an HF checkpoint of `google/gemma-4-31B` (or your private equivalent) plus `google/gemma-4-31B-it-assistant`. Blackwell GPU. flash-attention enabled.
+
+```bash
+# 1. Convert backbone HF -> GGUF f16
+python convert_hf_to_gguf.py /path/to/gemma-4-31B          --outtype f16 \
+    --outfile /models/gemma-4-31B.f16.gguf
+
+# 2. Convert assistant HF -> GGUF f16
+python convert_hf_to_gguf.py /path/to/gemma-4-31B-it-assistant --outtype f16 \
+    --outfile /models/gemma-4-31B-it-assistant.f16.gguf
+
+# 3. Quantize the target to NVFP4 (the draft stays f16 -- it's tiny)
+./build/bin/llama-quantize /models/gemma-4-31B.f16.gguf \
+                          /models/gemma-4-31B.NVFP4.gguf NVFP4
+
+# 4. Run llama-server
+./build/bin/llama-server \
+    --model       /models/gemma-4-31B.NVFP4.gguf \
+    --model-draft /models/gemma-4-31B-it-assistant.f16.gguf \
+    --spec-type draft-gemma4-assistant \
+    -c 131072 \
+    -ngl all -ngld all \
+    --cache-type-k q8_0 --cache-type-v q5_1 \
+    --flash-attn on \
+    --kv-unified \
+    --parallel 1 \
+    --spec-draft-n-max 1
+```
+
+Mandatory flags and why:
+- `--parallel 1` — the driver is single-sequence; multi-seq aborts with a clear error.
+- `--flash-attn on` — required for Phase E backfill (so `v_trans=false`).
+- `--spec-draft-n-max 1` — K=1 wins at this acceptance ceiling.
+- `-c 131072` (or whatever you want, up to the model's max) — speculation works at all context lengths but the win grows with context (since target verify is the bigger cost there).
+
+Tunable env vars (defaults shown):
+- `G4A_HOST_KV=0` — use the device-view full KV path (faster). `=1` to fall back to host (debug; per-step host→device copy).
+- `G4A_PRIME=0` — priming step off (zero acceptance gain in our A/B). `=1` to re-enable as an experiment.
+- `G4A_DEBUG_KV` — devtool-only knob in `spec_run.cpp`; not used by the server.
+
+The server will print, periodically, lines like:
+```
+g4a time[cyc=N acc_len=A]: draft()=X ms/call | per step: decode=Y ms sample+read=Z ms (n_step=S) prime=0 dft_graphs_reused=R
+g4a accept[cycles=N]: k0=KK.K% k1=L.L% avg_acc=A.AA drafts/cycle
+g4a mem[cyc=N]:   rss=R MiB acc_len=A kv=dev | acc_kf/vf=A/B MiB | acc_ks/vs=C/D MiB | vbuf=E MiB
+g4a: backfilled N shared-KV positions [a,b) from target cache (swa rows c/d); realigned
+```
+
+These are the production telemetry. `k0` is the headline acceptance number (per-draft); `dft_graphs_reused` should climb monotonically; `acc_len` should equal the `pos0` in the corresponding `proc` line; backfill lines fire when caching restores a prefix.
+
+---
+
+## 8. Limitations and what would lift the ceiling
+
+**Hard limits in this fork:**
+- **Single sequence.** Multi-seq would need per-seq state in the driver (acc_len, last_hidden, vbuf, etc.) and a multi-stream KV plan. Not done.
+- **Requires flash-attention on the target.** The KV-cache backfill (Phase E) reads contiguous V rows; without `-fa` V is transposed and the read API returns -1.
+- **Gemma 4 only.** The target's `sliding_window_pattern` and the layer indices (`L_full=59`, `L_swa=58`) are derived from `n_layer` modulo 6. Different Gemma 4 sizes (other than 31B) would work; non-Gemma-4 backbones would not — by design, the assistant is bonded to its backbone.
+
+**Soft limits (could be revisited):**
+- **K=2 doesn't help.** A k=1 acceptance of ~2% at this draft means a second step's expected yield is ~0.02 tokens, far below the ~10 ms step cost. If a future draft (different training, different precision target) raised k0 *and* k1, K>1 might pay off again.
+- **The ~28% per-draft acceptance ceiling is NVFP4-target-bound.** A higher-precision target would lift it. None fits in 32 GiB at this size.
+- **`spec_run` and `test_decode` devtools** assume the old (pre-on-device-post_proj) embedding-output shape and would need a one-line update before they can be re-used as numerical gates.
+
+---
+
+## 9. What we learned about llama.cpp's graph-reuse machinery
+
+A discovery that surprised us and is probably useful to anyone implementing a custom architecture:
+
+- `llm_graph_input_i::can_reuse` returns **false** by default. If your custom graph input doesn't override it, your graph is rebuilt on *every* decode — including CUDA-graph capture being disabled, which can be a ~10 ms fixed cost per step for even a small model.
+- Reuse engages when:
+  1. The graph params (`llm_graph_params::allow_reuse`) say so — typically the case for steady decode (n_tokens=1, n_outputs=1, gtype unchanged).
+  2. Every input in the result implements `can_reuse` and returns true.
+- For shapes that change every cycle (like our `kv_len_full = acc_len`), bucket them to a quantum and mask out the padding in the relevant op. `ggml_soft_max_ext` with a mask of `[0, ..., 0, -inf, ..., -inf]` is exact (the padded positions contribute 0 to softmax and therefore 0 to the attention output).
+
+The ~10 ms/step rebuild penalty is invisible until measured; it doesn't show up in the target-side `graphs_reused` counter (that's per-context) and there's no per-decode warning. The `llama_perf_context(ctx_dft).n_reused` counter is the diagnostic; if it stays at 0 while you decode many tokens, you're not reusing.
+
+---
+
+## 10. What we learned about acc_len / pos0 alignment
+
+`llama-server` has *three* ways the target's KV gets prefix tokens without re-decoding them:
+
+1. `--cache-ram <N>` — cross-request **prompt cache**.
+2. `--ctx-checkpoints <N>` — per-slot **context checkpoints** (SWA-bounded snapshots).
+3. **LCP slot-similarity reuse** (always on; `--slot-prompt-similarity` controls the threshold).
+
+Any of them can cause `pos0 > acc_len` (the driver missed positions the target has). The first two can be disabled with flags; the third is fundamental to how the server schedules work and can't be turned off without sacrificing all of the prefill efficiency.
+
+So a robust draft *must* tolerate restores. Two complementary mechanisms ended up being necessary:
+
+- **`truncate_to(pos0)` on `pos0 < acc_len`** — handles rewinds (server reusing a *shorter* prefix than what the driver had committed). The full-layer KV for positions `[0, pos0)` stays valid since it's the same tokens; the SWA window is cleared and refills naturally.
+- **`backfill_gap(pos0)` on `pos0 > acc_len`** — handles forward gaps (server restored a longer prefix than the driver knows). Reads layers 58/59 of the target's KV cache for `[acc_len, pos0)`, commits them, drafting resumes aligned.
+
+Together with `if (pos0 == 0) reset_state()` they cover every restore the server can do.
+
+---
+
+## 11. Commit log (selected)
+
+Reverse chronological, just the entries that map onto sections above. See `git log` for the full sequence.
+
+| Commit | Theme |
+|---|---|
+| `d9bbdeeaf` | GPU argmax + skip logits readback |
+| `1732ad5f3`,`c973d1100` | kv_len bucketing + can_reuse + mask shape fix |
+| `df94fdc79`,`a07e9d269` | Priming step + A/B (default off) |
+| `e2752a07c`,`409ea27ab` | Phase E KV-cache backfill |
+| `6db18160a` | Graceful pause on capture gap |
+| `ae8ea24f9` | post_projection on-device, lighter clear, K cap |
+| `02e4647ac` | Position-alignment fix (the +930 desync) |
+| `20bc5e914` | SWA host windowing |
+| `46285cbae` | Multi-seq guard + the host-RAM OOM fix (cap → vbuf) |
+| `89fefbcea` | Device-resident full-layer KV |
+| `87f55b8fe` | SWA windowing + F16 KV inputs |
+| `f2af48229`,`b6c868c12`,`b6578e958` | Eval-callback persistence, draft n_ubatch fixes |
+| `febaa0cce`,`a1e6229a1` | First end-to-end lossless speculation + NVFP4 mtp scales |
+| `0213ea440` | cb_eval probe confirming target KV extraction |
+| `d4103e91c`,`fee3b0f0e`,`b9faf9dd8` | Inference graph, ggml replay, numpy reference (Phase C1) |
+| `9fbae1b16` | HF→GGUF + arch load path + initial NVFP4 wiring (Phase A/B) |
+| `35018cc2d` | NVFP4 quantize emitter |
+
+Most of these commits include `Co-Authored-By: Claude` trailers reflecting the pair-programming workflow.
+
+---
+
+## 12. Closing notes
+
+The speculative draft is **net-positive but the gain is bounded by the NVFP4 target's acceptance ceiling**, not by the draft's speed. Most of the engineering effort after the integration worked focused on (a) keeping it correct under the server's restore behaviors and (b) closing the per-decode fixed overheads (graph rebuild, host argmax, KV transport) so the speculation's small acceptance edge actually translates into tg. We got there.
+
+The NVFP4 quantize emitter is independent and the more broadly reusable piece — it's not Gemma-4-specific and lets anyone quantize a model to NVFP4 with llama.cpp alone.
+
+For an entry-level reader, the headline takeaways:
+
+- You *can* run a Gemma 4 31B + its real speculative draft on a 32 GiB consumer-class Blackwell GPU at 128K context, losslessly, with caching and speculation cooperating.
+- The win is real (≈+10–20% tg) but capped by the NVFP4 target. If someone publishes a higher-precision compressed Gemma 4 31B (or smaller / better-trained drafts), this scaffolding accelerates immediately without code changes.
+- Implementing a custom speculative draft against `llama-server`'s caching, slot, and KV machinery surfaces a lot of structural assumptions in the runtime; the work above documents (and patches) the load-bearing ones.
