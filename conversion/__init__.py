@@ -78,6 +78,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Gemma4AssistantForCausalLM": "gemma",
     "Gemma4ForConditionalGeneration": "gemma",
     "Gemma4ForCausalLM": "gemma",
+    "Gemma4UnifiedForConditionalGeneration": "gemma",
     "GemmaForCausalLM": "gemma",
     "Glm4ForCausalLM": "glm",
     "Glm4MoeForCausalLM": "glm",
