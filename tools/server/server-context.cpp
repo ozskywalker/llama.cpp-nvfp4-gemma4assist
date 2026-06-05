@@ -45,6 +45,14 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
+    // the gemma4_assistant draft needs the target's hidden state at every prompt position (the
+    // prefill marks all prompt tokens as outputs, like an embedding model), so the target context
+    // must allow up to n_batch outputs -- not the 1+n_max speculative budget below.
+    if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT) != params.speculative.types.end()) {
+        return n_batch;
+    }
+
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
