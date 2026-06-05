@@ -830,10 +830,11 @@ class llm_graph_input_gemma4_assistant : public llm_graph_input_i {
 public:
     llm_graph_input_gemma4_assistant(const llama_gemma4_assistant_io * io) : io(io) {}
     void set_input(const llama_ubatch * ubatch) override;
-    // The graph can be reused as long as its tensor shapes are unchanged. kv_len_swa is steady
-    // (== sliding_window after warmup) and kv_len_full is bucketed (rounded up), so the shape only
-    // changes when acc_len crosses a bucket boundary -- enabling graph reuse + CUDA graphs across the
-    // many decodes in between (the draft otherwise rebuilds its graph every single decode).
+    // The graph can be reused as long as its tensor shapes are unchanged. Both kv_len_swa and
+    // kv_len_full are bucketed (rounded up), so the shape only changes when acc_len crosses a bucket
+    // boundary -- enabling graph reuse + CUDA graphs across the many decodes in between (the draft
+    // otherwise rebuilds its graph every single decode). Bucketing the sliding length too lets reuse
+    // engage from the first bucket instead of waiting for the window to saturate at sliding_window.
     bool can_reuse(const llm_graph_params & params) override;
 
     // round a KV length up to a fixed bucket so the graph shape is stable across decodes
@@ -844,10 +845,11 @@ public:
     ggml_tensor * v_full = nullptr;
     ggml_tensor * k_swa  = nullptr;
     ggml_tensor * v_swa  = nullptr;
-    ggml_tensor * kq_mask_full = nullptr; // [kv_full_bucket, 1]: 0 for real positions, -inf for padding
+    ggml_tensor * kq_mask_full = nullptr; // [kv_full_bucket, n_tokens]: 0 for real positions, -inf for padding
+    ggml_tensor * kq_mask_swa  = nullptr; // [kv_swa_bucket,  n_tokens]: 0 for real positions, -inf for padding
 
     int built_kv_full = 0; // bucketed full-KV length this graph was built with (for can_reuse)
-    int built_kv_swa  = 0; // sliding-KV length this graph was built with
+    int built_kv_swa  = 0; // bucketed sliding-KV length this graph was built with
 
     const llama_gemma4_assistant_io * io = nullptr;
 };

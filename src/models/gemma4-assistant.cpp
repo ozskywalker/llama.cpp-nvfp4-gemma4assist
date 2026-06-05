@@ -128,28 +128,41 @@ void llm_graph_input_gemma4_assistant::set_input(const llama_ubatch * ubatch) {
     auto cp_full = [](ggml_tensor * t, const void * src, int64_t n_real) {
         if (t && src) {
             GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
-            memcpy(t->data, src, (size_t) std::min<int64_t>(n_real, t->ne[2]) * t->nb[2]);
+            const int64_t real = std::min<int64_t>(n_real, t->ne[2]);
+            memcpy(t->data, src, (size_t) real * t->nb[2]);
+            // zero the [real, bucket) padding so the masked positions are guaranteed finite: an
+            // uninitialized F16 NaN there would propagate through soft_max_ext despite the -inf mask
+            // (NaN + -inf = NaN). The memset is small (only the bucket tail) relative to the matmuls.
+            const int64_t pad = t->ne[2] - real;
+            if (pad > 0) {
+                memset((char *) t->data + (size_t) real * t->nb[2], 0, (size_t) pad * t->nb[2]);
+            }
         }
     };
     cp(embd,   io->embd);
     cp_full(k_full, io->k_full, io->kv_len_full);
     cp_full(v_full, io->v_full, io->kv_len_full);
-    cp(k_swa,  io->k_swa);
-    cp(v_swa,  io->v_swa);
-    // full-layer mask: 0 for the real positions [0, kv_len_full), -inf for the bucket padding.
+    // sliding-layer KV is bucketed too -> copy only the real positions; the [real, bucket) padding
+    // stays uninitialized and is masked out by kq_mask_swa.
+    cp_full(k_swa, io->k_swa, io->kv_len_swa);
+    cp_full(v_swa, io->v_swa, io->kv_len_swa);
+    // bucketed-KV softmax mask: 0 for the real positions [0, kv_len), -inf for the bucket padding.
     // Every query row (ne[1]) sees the same KV mask.
-    if (kq_mask_full) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_full->buffer));
-        float * mdst = (float *) kq_mask_full->data;
-        const int64_t nkv  = kq_mask_full->ne[0];
-        const int64_t nq   = kq_mask_full->ne[1];
-        const int64_t real = std::min<int64_t>(io->kv_len_full, nkv);
+    auto fill_mask = [](ggml_tensor * t, int64_t kv_real) {
+        if (!t) return;
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+        float * mdst = (float *) t->data;
+        const int64_t nkv  = t->ne[0];
+        const int64_t nq   = t->ne[1];
+        const int64_t real = std::min<int64_t>(kv_real, nkv);
         for (int64_t c = 0; c < nq; ++c) {
             float * row = mdst + c * nkv;
             for (int64_t j = 0;    j < real; ++j) row[j] = 0.0f;
             for (int64_t j = real; j < nkv;  ++j) row[j] = -INFINITY;
         }
-    }
+    };
+    fill_mask(kq_mask_full, io->kv_len_full);
+    fill_mask(kq_mask_swa,  io->kv_len_swa);
 }
 
 bool llm_graph_input_gemma4_assistant::can_reuse(const llm_graph_params & params) {
@@ -161,7 +174,8 @@ bool llm_graph_input_gemma4_assistant::can_reuse(const llm_graph_params & params
     }
     int64_t kv_full = kv_bucket(io->kv_len_full); // replicate build_arch_graph's bucketing + device cap
     if (io->dev_k_full) kv_full = std::min<int64_t>(kv_full, io->dev_k_full->ne[2]);
-    return (int) kv_full == built_kv_full && io->kv_len_swa == built_kv_swa;
+    const int64_t kv_swa = kv_bucket(io->kv_len_swa); // sliding length is bucketed the same way
+    return (int) kv_full == built_kv_full && (int) kv_swa == built_kv_swa;
 }
 
 // Forward graph, transcribed from the numpy- and ggml-verified reference
@@ -185,8 +199,13 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
     // capacity when we're viewing it.
     int64_t kv_len_full = llm_graph_input_gemma4_assistant::kv_bucket((int) kv_full_real);
     if (io && io->dev_k_full) kv_len_full = std::min<int64_t>(kv_len_full, io->dev_k_full->ne[2]);
-    const int64_t kv_len_swa  = (io && io->kv_len_swa  > 0) ? io->kv_len_swa
+    const int64_t kv_swa_real = (io && io->kv_len_swa  > 0) ? io->kv_len_swa
                                                             : std::min<int64_t>(std::max<int64_t>(cparams.n_ctx, 1), std::max<uint32_t>(hparams.n_swa, 1));
+    // Bucket the sliding-KV length too (mirror the full layer): kv_len_swa grows by ~1 per decode
+    // until it saturates at sliding_window, so feeding it exact forced a graph rebuild every cycle.
+    // Bucketing makes the shape stable within each bucket; padding [kv_swa_real, kv_len_swa) is masked
+    // out in the sliding-layer softmax. (No device-tensor cap here -- the SWA KV is a host input.)
+    const int64_t kv_len_swa = llm_graph_input_gemma4_assistant::kv_bucket((int) kv_swa_real);
 
     // representative swa / full layers (for the external KV head dims)
     int idx_swa = -1, idx_full = -1;
@@ -221,9 +240,13 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
         inp->v_swa = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hparams.n_embd_head_k_swa, hparams.n_head_kv(idx_swa), kv_len_swa);
         ggml_set_input(inp->k_swa);
         ggml_set_input(inp->v_swa);
+        // sliding-layer softmax mask: 0 for real positions, -inf for the bucket padding (set_input
+        // fills it from io->kv_len_swa). ne[1] must be >= the query count (n_tokens>1 during reserve).
+        inp->kq_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_len_swa, n_tokens);
+        ggml_set_input(inp->kq_mask_swa);
     }
     // full-layer softmax mask: 0 for the real positions, -inf for the bucket padding (set_input fills it
-    // from io->kv_len_full). Only the full layer is bucketed; sliding layers feed exact kv_len_swa.
+    // from io->kv_len_full). Both layer types are bucketed (the sliding mask is built above).
     // ne[1] must be >= the query count (kq->ne[1] == n_tokens; n_tokens>1 during graph_reserve).
     inp->kq_mask_full = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_len_full, n_tokens);
     ggml_set_input(inp->kq_mask_full);
@@ -262,8 +285,8 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model_, const llm
         ggml_tensor * q_p = ggml_permute(ctx0, Q, 0, 2, 1, 3);                  // [hd, q, nh]
         ggml_tensor * k_p = ggml_permute(ctx0, K, 0, 2, 1, 3);                  // [hd, kv_len, nkv]
         ggml_tensor * kq  = ggml_mul_mat(ctx0, k_p, q_p);                       // [kv_len, q, nh] (GQA bcast)
-        // full layer: kv_len is bucketed -> mask out the padding positions; swa: exact length, no mask.
-        kq = swa ? ggml_soft_max(ctx0, kq)                                     // scale 1.0, no mask (q_len==1)
+        // both layer types are bucketed -> mask out the padding positions (scale 1.0, no ALiBi bias).
+        kq = swa ? ggml_soft_max_ext(ctx0, kq, INP->kq_mask_swa,  1.0f, 0.0f)
                  : ggml_soft_max_ext(ctx0, kq, INP->kq_mask_full, 1.0f, 0.0f);
         ggml_tensor * v_p = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3)); // [kv_len, hd, nkv]
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v_p, kq);                       // [hd, q, nh]
