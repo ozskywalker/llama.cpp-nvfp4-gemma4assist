@@ -300,7 +300,7 @@ Implemented the matched-pair seed (run one extra draft decode from `(last_tok, l
 
 ## Broader lessons (for other contributors)
 
-Two findings worth surfacing because they generalize beyond this fork:
+Three findings worth surfacing because they generalize beyond this fork:
 
 ### Graph reuse is OFF by default in llama.cpp
 
@@ -323,6 +323,12 @@ Disabling 1 + 2 doesn't eliminate gaps because 3 is fundamental to how the serve
 - `pos0 == 0` → fresh sequence, reset driver state.
 
 Together these cover every restore the server can do.
+
+### Rebasing onto upstream can silently break a custom draft through shared helpers
+
+Upstream `de6f727aa` ("limit max outputs of `llama_context`") capped each context's output budget and added a hard `GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)`. For the server, `server_n_outputs_max()` sizes the *target* context at `1 + spec_n_max` outputs — but the gemma4_assistant draft needs the target's hidden state at *every* prompt position, so prefill marks all prompt tokens as outputs (exactly like an embedding model). The result: after the rebase, any prompt longer than `1 + spec_n_max` tokens aborted at prefill — code that was correct when written, broken by an upstream change to a shared helper it never touched.
+
+The fix is one line in spirit: treat `draft-gemma4-assistant` like the embedding/pooling case and grant it the full `n_batch` output budget (commit `811b32a53`). The lesson: a custom draft's correctness depends on shared server/runtime helpers (output budgets, batch sizing, KV plumbing) that upstream evolves independently. After every rebase, re-run an end-to-end speculative decode — a unit test that drafts 2 tokens won't trip a cap that only bites past `1 + spec_n_max` prompt tokens.
 
 ## Open items / future work
 
