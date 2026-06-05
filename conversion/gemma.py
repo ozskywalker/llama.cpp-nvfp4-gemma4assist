@@ -765,7 +765,7 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
-@ModelBase.register("Gemma4AssistantForCausalLM")
+@ModelBase.register("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
 class Gemma4AssistantModel(Gemma4Model):
     # Speculative-decoding draft head for a Gemma 4 backbone. It is a dense Gemma 4 text
     # stack (no MoE, no per-layer embeddings, all KV layers shared) with no K/V projections:
