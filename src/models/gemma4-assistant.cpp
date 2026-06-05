@@ -19,12 +19,12 @@
 
 void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
 
     // all layers share the backbone KV
     uint32_t n_kv_shared_layers = 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
-    hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t) n_kv_shared_layers;
+    hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t) n_kv_shared_layers;
 
     hparams.f_attention_scale = 1.0f; // matches Gemma4 (self.scaling = 1.0)
 

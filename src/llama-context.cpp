@@ -3639,18 +3639,6 @@ int32_t llama_kv_read_layer_f32(llama_context * ctx, int32_t il, llama_seq_id se
     return ctx->kv_read_layer_f32(il, seq_id, p0, p1, k_out, v_out);
 }
 
-float * llama_get_embeddings_pre_norm(llama_context * ctx) {
-    ctx->synchronize();
-
-    return ctx->get_embeddings_pre_norm();
-}
-
-float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
-
-    return ctx->get_embeddings_pre_norm_ith(i);
-}
-
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
