@@ -5,6 +5,8 @@ exclude =
     # Do not traverse examples and tools
     examples,
     tools,
+    # Fork-local dev/validation harnesses (print()-driven HF-introspection scripts)
+    devtools,
     # Do not include package initializers
     __init__.py,
     # No need to traverse our git directory

@@ -5,7 +5,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_pre_norm / llama_get_embeddings_pre_norm_ith (used by MTP)
+#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
@@ -18,7 +18,9 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
-#include <unistd.h>
+#if defined(__linux__)
+#include <unistd.h> // sysconf(_SC_PAGESIZE), used by g4a_rss_mb() (Linux /proc-based diagnostics)
+#endif
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -166,7 +168,7 @@ struct common_speculative_impl {
     virtual bool need_embd() const = 0;
 
     // true if this implementation requires the target context to extract pre-norm embeddings
-    virtual bool need_embd_pre_norm() const { return false; }
+    virtual bool need_embd_nextn() const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -491,8 +493,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -587,7 +589,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         //                                                       ^--- this is a problem
         // TODO:this is generally true, but would be nice to assert it
         {
-            const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
 
             //{
@@ -629,7 +631,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -690,7 +692,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -776,7 +778,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return false;
     }
 
-    bool need_embd_pre_norm() const override {
+    bool need_embd_nextn() const override {
         return true;
     }
 };
@@ -788,12 +790,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 namespace {
 // resident set size (anonymous + file), MiB -- for leak diagnosis
 static double g4a_rss_mb() {
+#if defined(__linux__)
     FILE * f = fopen("/proc/self/statm", "r");
     if (!f) return -1.0;
     long size = 0, resident = 0;
     if (fscanf(f, "%ld %ld", &size, &resident) != 2) { fclose(f); return -1.0; }
     fclose(f);
     return resident * (double) sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+#else
+    return -1.0; // RSS diagnostics are Linux-only (/proc/self/statm); harmless sentinel elsewhere
+#endif
 }
 
 struct g4a_raw { std::vector<uint8_t> bytes; enum ggml_type type = GGML_TYPE_F32; int64_t ne[4] = {1,1,1,1}; };
@@ -1798,6 +1804,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_GEMMA4_ASSISTANT:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -2020,13 +2027,13 @@ bool common_speculative_need_embd(common_speculative * spec) {
     return false;
 }
 
-bool common_speculative_need_embd_pre_norm(common_speculative * spec) {
+bool common_speculative_need_embd_nextn(common_speculative * spec) {
     if (spec == nullptr) {
         return false;
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->need_embd_pre_norm()) {
+        if (impl->need_embd_nextn()) {
             return true;
         }
     }
