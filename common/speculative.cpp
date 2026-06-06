@@ -18,7 +18,9 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
-#include <unistd.h>
+#if defined(__linux__)
+#include <unistd.h> // sysconf(_SC_PAGESIZE), used by g4a_rss_mb() (Linux /proc-based diagnostics)
+#endif
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -788,12 +790,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 namespace {
 // resident set size (anonymous + file), MiB -- for leak diagnosis
 static double g4a_rss_mb() {
+#if defined(__linux__)
     FILE * f = fopen("/proc/self/statm", "r");
     if (!f) return -1.0;
     long size = 0, resident = 0;
     if (fscanf(f, "%ld %ld", &size, &resident) != 2) { fclose(f); return -1.0; }
     fclose(f);
     return resident * (double) sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0);
+#else
+    return -1.0; // RSS diagnostics are Linux-only (/proc/self/statm); harmless sentinel elsewhere
+#endif
 }
 
 struct g4a_raw { std::vector<uint8_t> bytes; enum ggml_type type = GGML_TYPE_F32; int64_t ne[4] = {1,1,1,1}; };
