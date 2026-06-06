@@ -8,6 +8,8 @@ deprecated = "warn"
 [src]
 exclude = [
     "./tools/mtmd/legacy-models/**",
+    # Fork-local dev/validation harnesses (HF/torch introspection trips static typing)
+    "./devtools/**",
 ]
 
 [[overrides]]
